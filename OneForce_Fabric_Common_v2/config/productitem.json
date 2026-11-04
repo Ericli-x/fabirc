@@ -1,0 +1,8 @@
+{
+  "mode": "table",
+  "source_table": "dbo.jp_dw_dsj_productitem_dim",
+  "source_column": "productitemnamekanji",
+  "output_column": "productitemnamekanji_normalized",
+  "allow_empty": false,
+  "write_output": false
+}

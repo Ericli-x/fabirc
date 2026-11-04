@@ -1,0 +1,34 @@
+# NB_CommonTransform
+# セル単位でFabric Notebookへコピー。Pythonファイルとしての一括実行は不可。
+
+===== CELL 1: markdown =====
+# ④ 共通処理の呼出先
+同一ワークスペース・同一既定Lakehouseを使用。通常は`NB_ProductItem_Main`から実行。
+
+===== CELL 2: code（パラメータセルとしてマーク） =====
+# このセルを「パラメータとしてマーク」。取込後にUIで確認する。
+param_json = '{"mode":"sample","write_output":false}'
+execution_id = "manual_sample"
+
+===== CELL 3: code =====
+%run NB_CommonFunctions
+
+===== CELL 4: code =====
+import json
+try:
+    validate_execution_id(execution_id)
+    log_event("INFO", "COMMON_START", execution_id)
+    result = run_transform_job(spark, param_json, execution_id)
+    log_event("INFO", "COMMON_END", execution_id, row_count=result["row_count"],
+              changed_count=result["changed_count"], write_output=result["write_output"])
+    result_json = json.dumps(result, ensure_ascii=False, allow_nan=False)
+except Exception as exc:
+    # 原文や例外詳細を通常ログに出さない。Fabricの例外証跡の閲覧権限も管理する。
+    safe_id = execution_id if isinstance(execution_id, str) and len(execution_id) <= 64 else "invalid"
+    log_event("ERROR", "COMMON_FAILED", safe_id, error_type=type(exc).__name__,
+              error_code=getattr(exc, "code", "FABRIC_RUNTIME"))
+    raise
+
+===== CELL 5: code =====
+# exitは独立セルのトップレベル。try/exceptで囲まない。
+notebookutils.notebook.exit(result_json)

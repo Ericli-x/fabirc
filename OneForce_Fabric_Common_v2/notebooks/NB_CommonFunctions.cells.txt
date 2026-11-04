@@ -1,0 +1,264 @@
+# NB_CommonFunctions
+# セル単位でFabric Notebookへコピー。Pythonファイルとしての一括実行は不可。
+
+===== CELL 1: markdown =====
+# NB_CommonFunctions
+共通定義のみ。参照時にデータ読書き・exit・Sparkセッション作成を行いません。実装原本は `python/common_functions.py`。
+
+===== CELL 2: code =====
+"""OneForce 共通関数 v2.0 (Python 3.10+ / Fabric PySpark).
+
+NB_CommonFunctions の実装原本。import/%run 時は定義だけを行う。
+normalize_text は CSV レコード生成でも SQL リテラル化でもない。
+二重引用符の二重化は非冪等のため、未加工の原文に一度だけ適用する。
+"""
+from __future__ import annotations
+
+import json
+import re
+from datetime import datetime, timezone
+from typing import Any, Callable
+
+COMMON_VERSION = "2.0.0"
+TRIM_CHARACTERS = " \u00a0\u3000"
+OUTPUT_ROOT = "Files/oneforce_common/normalized"
+_IDENTIFIER = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,127}\Z")
+_EXECUTION_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}\Z")
+DEFAULT_CONFIG = {
+    "mode": "sample",
+    "source_table": "dbo.jp_dw_dsj_productitem_dim",
+    "source_column": "productitemnamekanji",
+    "output_column": "productitemnamekanji_normalized",
+    "allow_empty": False,
+    "write_output": False,
+}
+SAMPLE_VALUES = [None, "", "  製品A  ", "\u00a0製品B\u3000", '  A"B  ', " A\tB\nC "]
+
+
+class CommonError(ValueError):
+    """コードを保持する検証エラー。業務データ値はメッセージに含めない。"""
+
+    def __init__(self, code: str, message: str) -> None:
+        self.code = code
+        super().__init__(f"{code}: {message}")
+
+
+def normalize_text(value: str | None) -> str | None:
+    """両端の3種類の空白を除去し、ASCII二重引用符だけを二重化する。
+
+    Noneと空文字を区別し、タブ/CR/LFや途中の空白は保持する。
+    str以外を暗黙変換しない。U+0000はSQLとの共通契約の対象外。
+    """
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise CommonError("CMN001", "入力値は文字列またはNoneで指定してください。")
+    if "\x00" in value:
+        raise CommonError("CMN008", "U+0000は入力契約の対象外です。")
+    return value.strip(TRIM_CHARACTERS).replace('"', '""')
+
+
+def validate_identifier(value: str) -> str:
+    """単一識別子。ASCII英字/数字/下線のみ、先頭数字不可、最大128文字。"""
+    if not isinstance(value, str) or _IDENTIFIER.fullmatch(value) is None:
+        raise CommonError("CMN002", "テーブル名・列名の識別子が不正です。")
+    return value
+
+
+def quote_table_name(value: str) -> str:
+    """1～3階層の識別子を検証後、各要素をバッククォートで囲む。
+
+    許可した名前にも引用を施すため予約語が構文として解釈されない。
+    ワークスペース越しの4階層指定、空白、日本語名は本版の対象外。
+    """
+    if not isinstance(value, str):
+        raise CommonError("CMN002", "テーブル名は文字列で指定してください。")
+    parts = value.split(".")
+    if not 1 <= len(parts) <= 3:
+        raise CommonError("CMN002", "テーブル名は1～3階層で指定してください。")
+    return ".".join(f"`{validate_identifier(part)}`" for part in parts)
+
+
+def validate_execution_id(value: str) -> str:
+    if not isinstance(value, str) or _EXECUTION_ID.fullmatch(value) is None:
+        raise CommonError("CMN009", "execution_idは英数字で開始する64文字以内の英数字・_・-で指定してください。")
+    return value
+
+
+def _json_object(text: str, code: str) -> dict[str, Any]:
+    """重複キー/NaN/Infinityを拒否してJSONオブジェクトを読む。"""
+    if not isinstance(text, str) or not text or len(text.encode("utf-8")) > 16384:
+        raise CommonError(code, "JSON文字列は空でなく、UTF-8で16KB以下にしてください。")
+
+    def pairs_hook(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        result: dict[str, Any] = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError("duplicate JSON key")
+            result[key] = value
+        return result
+
+    def reject_constant(value: str) -> None:
+        raise ValueError("non-finite JSON number")
+
+    try:
+        result = json.loads(text, object_pairs_hook=pairs_hook, parse_constant=reject_constant)
+    except (ValueError, TypeError) as exc:
+        raise CommonError(code, "JSON形式が不正です。") from exc
+    if not isinstance(result, dict):
+        raise CommonError(code, "JSONの最上位はオブジェクトにしてください。")
+    return result
+
+
+def parse_config(param_json: str) -> dict[str, Any]:
+    supplied = _json_object(param_json, "CMN003")
+    if set(supplied) - set(DEFAULT_CONFIG):
+        raise CommonError("CMN003", "未定義の設定キーがあります。")
+    config = {**DEFAULT_CONFIG, **supplied}
+    if config["mode"] not in ("sample", "table"):
+        raise CommonError("CMN003", "modeはsampleまたはtableです。")
+    quote_table_name(config["source_table"])
+    validate_identifier(config["source_column"])
+    validate_identifier(config["output_column"])
+    if config["source_column"].casefold() == config["output_column"].casefold():
+        raise CommonError("CMN005", "原文列と出力列は別の名前にしてください。")
+    for name in ("allow_empty", "write_output"):
+        if type(config[name]) is not bool:
+            raise CommonError("CMN003", f"{name}はJSONのtrue/falseで指定してください。")
+    return config
+
+
+def normalize_text_col(column: Any) -> Any:
+    """Spark組込み関数によるColumn変換。Python UDFは使わない。
+
+    入力は文字列列で、U+0000を含まないことが前提。
+    run_transform_job は型/NULL文字をチェックしてから評価する。
+    Java正規表現は厳密な文字列先頭・末尾アンカーを使用（末尾改行を保持）。
+    """
+    from pyspark.sql import functions as F
+    trimmed = F.regexp_replace(column, r"\A[ \u00A0\u3000]+|[ \u00A0\u3000]+\z", "")
+    return F.regexp_replace(trimmed, '"', '""')
+
+
+def transform_dataframe(df: Any, source_column: str, output_column: str) -> Any:
+    """元列を保持して整形済列を追加。ここではSpark actionを起こさない。"""
+    from pyspark.sql import functions as F
+    from pyspark.sql.types import StringType
+    validate_identifier(source_column)
+    validate_identifier(output_column)
+    lower_names = [name.casefold() for name in df.columns]
+    if len(lower_names) != len(set(lower_names)):
+        raise CommonError("CMN004", "入力DataFrameに曖昧な重複列名があります。")
+    if source_column not in df.columns:
+        raise CommonError("CMN004", "対象列が存在しません。列名の大小文字も確認してください。")
+    if not isinstance(df.schema[source_column].dataType, StringType):
+        raise CommonError("CMN004", "対象列はSpark string型である必要があります。")
+    if output_column.casefold() in lower_names:
+        raise CommonError("CMN005", "出力列が既存列と衝突します。上書きしません。")
+    return df.withColumn(output_column, normalize_text_col(F.col(f"`{source_column}`")))
+
+
+def log_event(level: str, event: str, execution_id: str, **metadata: Any) -> None:
+    """ログに原文/変換値/秘密情報を渡さない。公開メタデータだけを出力。"""
+    print(json.dumps({
+        "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+        "level": level, "event": event, "execution_id": execution_id,
+        "metadata": metadata,
+    }, ensure_ascii=False, allow_nan=False))
+
+
+def run_transform_job(spark: Any, param_json: str, execution_id: str) -> dict[str, Any]:
+    """整形・件数検証・任意の新規Delta出力。既存テーブルは更新しない。"""
+    from pyspark.sql import functions as F
+    from pyspark.sql.types import StringType, StructField, StructType
+    config = parse_config(param_json)
+    validate_execution_id(execution_id)
+    source_col, output_col = config["source_column"], config["output_column"]
+    if config["mode"] == "sample":
+        df = spark.createDataFrame(
+            [(value,) for value in SAMPLE_VALUES],
+            StructType([StructField(source_col, StringType(), True)]),
+        )
+    else:
+        # SQL文字列を組み立てず、検証・引用済みのテーブル識別子を渡す。
+        df = spark.table(quote_table_name(config["source_table"]))
+    output = transform_dataframe(df, source_col, output_col).persist()
+    try:
+        src = F.col(f"`{source_col}`")
+        dst = F.col(f"`{output_col}`")
+        stats = output.agg(
+            F.count(F.lit(1)).alias("row_count"),
+            F.coalesce(F.sum(F.when(~src.eqNullSafe(dst), 1).otherwise(0)), F.lit(0)).alias("changed_count"),
+            F.coalesce(F.sum(F.when(src.isNull(), 1).otherwise(0)), F.lit(0)).alias("null_count"),
+            F.coalesce(F.sum(F.when(F.instr(src, "\x00") > 0, 1).otherwise(0)), F.lit(0)).alias("nul_count"),
+        ).first().asDict()
+        if stats["nul_count"]:
+            raise CommonError("CMN008", "入力にU+0000が含まれています。")
+        if not stats["row_count"] and not config["allow_empty"]:
+            raise CommonError("CMN006", "入力件数が0件です。")
+        output_path = None
+        if config["write_output"]:
+            output_path = f"{OUTPUT_ROOT}/{execution_id}"
+            # 既存パスを上書きしない。同じexecution_idの再実行は運用確認が必要。
+            output.write.format("delta").mode("errorifexists").save(output_path)
+        return {
+            "contract_version": "1.0", "status": "SUCCESS",
+            "execution_id": execution_id, "mode": config["mode"],
+            "row_count": int(stats["row_count"]),
+            "changed_count": int(stats["changed_count"]),
+            "null_count": int(stats["null_count"]),
+            "output_column": output_col, "output_path": output_path,
+            "write_output": config["write_output"], "library_version": COMMON_VERSION,
+        }
+    finally:
+        output.unpersist()
+
+
+def parse_run_result(raw: str, execution_id: str) -> dict[str, Any]:
+    validate_execution_id(execution_id)
+    result = _json_object(raw, "CMN007")
+    required = {"contract_version", "status", "execution_id", "mode", "row_count",
+                "changed_count", "null_count", "output_column", "output_path",
+                "write_output", "library_version"}
+    if set(result) != required:
+        raise CommonError("CMN007", "子Notebookの戻り値項目が契約と一致しません。")
+    if (result["contract_version"] != "1.0" or result["status"] != "SUCCESS"
+            or result["execution_id"] != execution_id
+            or result["library_version"] != COMMON_VERSION):
+        raise CommonError("CMN007", "子Notebookのステータス・実行ID・版が不正です。")
+    if result["mode"] not in ("sample", "table"):
+        raise CommonError("CMN007", "子Notebookのmodeが不正です。")
+    for key in ("row_count", "changed_count", "null_count"):
+        if type(result[key]) is not int or result[key] < 0:
+            raise CommonError("CMN007", "子Notebookの件数が不正です。")
+    if result["changed_count"] + result["null_count"] > result["row_count"]:
+        raise CommonError("CMN007", "子Notebookの件数に整合性がありません。")
+    validate_identifier(result["output_column"])
+    if type(result["write_output"]) is not bool:
+        raise CommonError("CMN007", "子Notebookのwrite_outputが不正です。")
+    expected_path = f"{OUTPUT_ROOT}/{execution_id}" if result["write_output"] else None
+    if result["output_path"] != expected_path:
+        raise CommonError("CMN007", "子Notebookの出力パスが契約と一致しません。")
+    return result
+
+
+def run_common_notebook(
+    runner: Callable[..., str], param_json: str, execution_id: str,
+    timeout_seconds: int = 600,
+) -> dict[str, Any]:
+    """Fabric runnerを注入して親側で検証。例外/タイムアウトを握りつぶさない。"""
+    config = parse_config(param_json)
+    validate_execution_id(execution_id)
+    if type(timeout_seconds) is not int or not 1 <= timeout_seconds <= 43200:
+        raise CommonError("CMN010", "タイムアウトは1～43200秒の整数で指定してください。")
+    raw = runner("NB_CommonTransform", timeout_seconds, {
+        "param_json": json.dumps(config, ensure_ascii=False, allow_nan=False),
+        "execution_id": execution_id,
+    })
+    result = parse_run_result(raw, execution_id)
+    if (result["mode"] != config["mode"] or result["output_column"] != config["output_column"]
+            or result["write_output"] != config["write_output"]):
+        raise CommonError("CMN007", "子Notebookが要求と異なる設定で実行されました。")
+    if not result["row_count"] and not config["allow_empty"]:
+        raise CommonError("CMN006", "子Notebookの処理件数が0件です。")
+    return result

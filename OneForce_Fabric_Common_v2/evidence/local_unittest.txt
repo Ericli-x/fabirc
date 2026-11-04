@@ -1,0 +1,52 @@
+test_bad_return_properties (test_common_functions.CallerTests.test_bad_return_properties) ... ok
+test_bad_timeout_before_call (test_common_functions.CallerTests.test_bad_timeout_before_call) ... ok
+test_call_and_arguments (test_common_functions.CallerTests.test_call_and_arguments) ... ok
+test_disallowed_zero_rows (test_common_functions.CallerTests.test_disallowed_zero_rows) ... ok
+test_empty_return (test_common_functions.CallerTests.test_empty_return) ... ok
+test_exception_propagated_without_retry (test_common_functions.CallerTests.test_exception_propagated_without_retry) ... ok
+test_logging (test_common_functions.CallerTests.test_logging) ... ok
+test_missing_and_extra_fields (test_common_functions.CallerTests.test_missing_and_extra_fields) ... ok
+test_parameter_mismatch (test_common_functions.CallerTests.test_parameter_mismatch) ... ok
+test_valid_return (test_common_functions.CallerTests.test_valid_return) ... ok
+test_write_path (test_common_functions.CallerTests.test_write_path) ... ok
+test_boolean_type (test_common_functions.ConfigTests.test_boolean_type) ... ok
+test_defaults (test_common_functions.ConfigTests.test_defaults) ... ok
+test_duplicate_keys (test_common_functions.ConfigTests.test_duplicate_keys) ... ok
+test_execution_id (test_common_functions.ConfigTests.test_execution_id) ... ok
+test_invalid_identifiers (test_common_functions.ConfigTests.test_invalid_identifiers) ... ok
+test_invalid_json (test_common_functions.ConfigTests.test_invalid_json) ... ok
+test_invalid_modes (test_common_functions.ConfigTests.test_invalid_modes) ... ok
+test_invalid_table_names (test_common_functions.ConfigTests.test_invalid_table_names) ... ok
+test_nonfinite (test_common_functions.ConfigTests.test_nonfinite) ... ok
+test_source_output_collision (test_common_functions.ConfigTests.test_source_output_collision) ... ok
+test_unknown_key (test_common_functions.ConfigTests.test_unknown_key) ... ok
+test_valid_config (test_common_functions.ConfigTests.test_valid_config) ... ok
+test_valid_identifiers (test_common_functions.ConfigTests.test_valid_identifiers) ... ok
+test_TXT01 (test_common_functions.NormalizeTests.test_TXT01) ... ok
+test_TXT02 (test_common_functions.NormalizeTests.test_TXT02) ... ok
+test_TXT03 (test_common_functions.NormalizeTests.test_TXT03) ... ok
+test_TXT04 (test_common_functions.NormalizeTests.test_TXT04) ... ok
+test_TXT05 (test_common_functions.NormalizeTests.test_TXT05) ... ok
+test_TXT06 (test_common_functions.NormalizeTests.test_TXT06) ... ok
+test_TXT07 (test_common_functions.NormalizeTests.test_TXT07) ... ok
+test_TXT08 (test_common_functions.NormalizeTests.test_TXT08) ... ok
+test_TXT09 (test_common_functions.NormalizeTests.test_TXT09) ... ok
+test_TXT10 (test_common_functions.NormalizeTests.test_TXT10) ... ok
+test_TXT11 (test_common_functions.NormalizeTests.test_TXT11) ... ok
+test_TXT12 (test_common_functions.NormalizeTests.test_TXT12) ... ok
+test_TXT13 (test_common_functions.NormalizeTests.test_TXT13) ... ok
+test_TXT14 (test_common_functions.NormalizeTests.test_TXT14) ... ok
+test_TXT15 (test_common_functions.NormalizeTests.test_TXT15) ... ok
+test_TXT16 (test_common_functions.NormalizeTests.test_TXT16) ... ok
+test_TXT17 (test_common_functions.NormalizeTests.test_TXT17) ... ok
+test_TXT18 (test_common_functions.NormalizeTests.test_TXT18) ... ok
+test_TXT19 (test_common_functions.NormalizeTests.test_TXT19) ... ok
+test_TXT20 (test_common_functions.NormalizeTests.test_TXT20) ... ok
+test_not_idempotent (test_common_functions.NormalizeTests.test_not_idempotent) ... ok
+test_nul_rejected (test_common_functions.NormalizeTests.test_nul_rejected) ... ok
+test_type_rejected (test_common_functions.NormalizeTests.test_type_rejected) ... ok
+
+----------------------------------------------------------------------
+Ran 47 tests in 0.002s
+
+OK

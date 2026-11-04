@@ -1,0 +1,28 @@
+# NB_CommonCall_Precheck
+# セル単位でFabric Notebookへコピー。Pythonファイルとしての一括実行は不可。
+
+===== CELL 1: markdown =====
+# ④ 親子呼出し結合試験
+成功経路と、子Notebookの入力不正時に親へ例外が伝わることを確認。データ書込みなし。
+
+===== CELL 2: code =====
+%run NB_CommonFunctions
+
+===== CELL 3: code =====
+from uuid import uuid4
+import json
+run_id = str(uuid4())
+result = run_common_notebook(notebookutils.notebook.run,
+                             '{"mode":"sample","write_output":false}', run_id, 600)
+if (result["row_count"], result["changed_count"], result["null_count"]) != (6,4,1):
+    raise AssertionError("サンプル件数の期待値不一致")
+# 親の検証をあえて通さず、子のパラメータセルと異常終了伝播を試験する。
+try:
+    notebookutils.notebook.run("NB_CommonTransform", 600,
+        {"param_json": '{"mode":"INVALID"}', "execution_id": str(uuid4())})
+except Exception as exc:
+    print(json.dumps({"case":"CHILD_ERROR_PROPAGATION", "status":"PASS",
+                      "exception_type":type(exc).__name__}))
+else:
+    raise AssertionError("子Notebookが異常入力を正常終了として返しました")
+print(json.dumps({"status":"PASS", "case":"CALL_SMOKE", "result":result},ensure_ascii=False))

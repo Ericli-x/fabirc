@@ -1,0 +1,5 @@
+Python files syntax OK: 2
+Notebook JSON OK: 5
+Python notebook cells syntax OK: 9
+Fabric %run cells: 4 (not executed locally)
+SQL / Fabric / PySpark execution: NOT RUN

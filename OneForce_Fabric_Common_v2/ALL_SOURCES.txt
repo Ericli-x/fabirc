@@ -1,0 +1,1767 @@
+OneForce Fabric Common v2.0.0 / SQL・Python・Notebookセルコピー用ソース
+各FILE/CELL単位で使用してください。全体の一括実行は不可。
+
+==========================================================================================
+FILE: config/productitem.json
+==========================================================================================
+{
+  "mode": "table",
+  "source_table": "dbo.jp_dw_dsj_productitem_dim",
+  "source_column": "productitemnamekanji",
+  "output_column": "productitemnamekanji_normalized",
+  "allow_empty": false,
+  "write_output": false
+}
+
+
+==========================================================================================
+FILE: config/sample.json
+==========================================================================================
+{
+  "mode": "sample",
+  "source_table": "dbo.jp_dw_dsj_productitem_dim",
+  "source_column": "productitemnamekanji",
+  "output_column": "productitemnamekanji_normalized",
+  "allow_empty": false,
+  "write_output": false
+}
+
+
+==========================================================================================
+FILE: notebooks/NB_CommonCall_Precheck.cells.txt
+==========================================================================================
+# NB_CommonCall_Precheck
+# セル単位でFabric Notebookへコピー。Pythonファイルとしての一括実行は不可。
+
+===== CELL 1: markdown =====
+# ④ 親子呼出し結合試験
+成功経路と、子Notebookの入力不正時に親へ例外が伝わることを確認。データ書込みなし。
+
+===== CELL 2: code =====
+%run NB_CommonFunctions
+
+===== CELL 3: code =====
+from uuid import uuid4
+import json
+run_id = str(uuid4())
+result = run_common_notebook(notebookutils.notebook.run,
+                             '{"mode":"sample","write_output":false}', run_id, 600)
+if (result["row_count"], result["changed_count"], result["null_count"]) != (6,4,1):
+    raise AssertionError("サンプル件数の期待値不一致")
+# 親の検証をあえて通さず、子のパラメータセルと異常終了伝播を試験する。
+try:
+    notebookutils.notebook.run("NB_CommonTransform", 600,
+        {"param_json": '{"mode":"INVALID"}', "execution_id": str(uuid4())})
+except Exception as exc:
+    print(json.dumps({"case":"CHILD_ERROR_PROPAGATION", "status":"PASS",
+                      "exception_type":type(exc).__name__}))
+else:
+    raise AssertionError("子Notebookが異常入力を正常終了として返しました")
+print(json.dumps({"status":"PASS", "case":"CALL_SMOKE", "result":result},ensure_ascii=False))
+
+
+==========================================================================================
+FILE: notebooks/NB_CommonFunctions.cells.txt
+==========================================================================================
+# NB_CommonFunctions
+# セル単位でFabric Notebookへコピー。Pythonファイルとしての一括実行は不可。
+
+===== CELL 1: markdown =====
+# NB_CommonFunctions
+共通定義のみ。参照時にデータ読書き・exit・Sparkセッション作成を行いません。実装原本は `python/common_functions.py`。
+
+===== CELL 2: code =====
+"""OneForce 共通関数 v2.0 (Python 3.10+ / Fabric PySpark).
+
+NB_CommonFunctions の実装原本。import/%run 時は定義だけを行う。
+normalize_text は CSV レコード生成でも SQL リテラル化でもない。
+二重引用符の二重化は非冪等のため、未加工の原文に一度だけ適用する。
+"""
+from __future__ import annotations
+
+import json
+import re
+from datetime import datetime, timezone
+from typing import Any, Callable
+
+COMMON_VERSION = "2.0.0"
+TRIM_CHARACTERS = " \u00a0\u3000"
+OUTPUT_ROOT = "Files/oneforce_common/normalized"
+_IDENTIFIER = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,127}\Z")
+_EXECUTION_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}\Z")
+DEFAULT_CONFIG = {
+    "mode": "sample",
+    "source_table": "dbo.jp_dw_dsj_productitem_dim",
+    "source_column": "productitemnamekanji",
+    "output_column": "productitemnamekanji_normalized",
+    "allow_empty": False,
+    "write_output": False,
+}
+SAMPLE_VALUES = [None, "", "  製品A  ", "\u00a0製品B\u3000", '  A"B  ', " A\tB\nC "]
+
+
+class CommonError(ValueError):
+    """コードを保持する検証エラー。業務データ値はメッセージに含めない。"""
+
+    def __init__(self, code: str, message: str) -> None:
+        self.code = code
+        super().__init__(f"{code}: {message}")
+
+
+def normalize_text(value: str | None) -> str | None:
+    """両端の3種類の空白を除去し、ASCII二重引用符だけを二重化する。
+
+    Noneと空文字を区別し、タブ/CR/LFや途中の空白は保持する。
+    str以外を暗黙変換しない。U+0000はSQLとの共通契約の対象外。
+    """
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise CommonError("CMN001", "入力値は文字列またはNoneで指定してください。")
+    if "\x00" in value:
+        raise CommonError("CMN008", "U+0000は入力契約の対象外です。")
+    return value.strip(TRIM_CHARACTERS).replace('"', '""')
+
+
+def validate_identifier(value: str) -> str:
+    """単一識別子。ASCII英字/数字/下線のみ、先頭数字不可、最大128文字。"""
+    if not isinstance(value, str) or _IDENTIFIER.fullmatch(value) is None:
+        raise CommonError("CMN002", "テーブル名・列名の識別子が不正です。")
+    return value
+
+
+def quote_table_name(value: str) -> str:
+    """1～3階層の識別子を検証後、各要素をバッククォートで囲む。
+
+    許可した名前にも引用を施すため予約語が構文として解釈されない。
+    ワークスペース越しの4階層指定、空白、日本語名は本版の対象外。
+    """
+    if not isinstance(value, str):
+        raise CommonError("CMN002", "テーブル名は文字列で指定してください。")
+    parts = value.split(".")
+    if not 1 <= len(parts) <= 3:
+        raise CommonError("CMN002", "テーブル名は1～3階層で指定してください。")
+    return ".".join(f"`{validate_identifier(part)}`" for part in parts)
+
+
+def validate_execution_id(value: str) -> str:
+    if not isinstance(value, str) or _EXECUTION_ID.fullmatch(value) is None:
+        raise CommonError("CMN009", "execution_idは英数字で開始する64文字以内の英数字・_・-で指定してください。")
+    return value
+
+
+def _json_object(text: str, code: str) -> dict[str, Any]:
+    """重複キー/NaN/Infinityを拒否してJSONオブジェクトを読む。"""
+    if not isinstance(text, str) or not text or len(text.encode("utf-8")) > 16384:
+        raise CommonError(code, "JSON文字列は空でなく、UTF-8で16KB以下にしてください。")
+
+    def pairs_hook(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        result: dict[str, Any] = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError("duplicate JSON key")
+            result[key] = value
+        return result
+
+    def reject_constant(value: str) -> None:
+        raise ValueError("non-finite JSON number")
+
+    try:
+        result = json.loads(text, object_pairs_hook=pairs_hook, parse_constant=reject_constant)
+    except (ValueError, TypeError) as exc:
+        raise CommonError(code, "JSON形式が不正です。") from exc
+    if not isinstance(result, dict):
+        raise CommonError(code, "JSONの最上位はオブジェクトにしてください。")
+    return result
+
+
+def parse_config(param_json: str) -> dict[str, Any]:
+    supplied = _json_object(param_json, "CMN003")
+    if set(supplied) - set(DEFAULT_CONFIG):
+        raise CommonError("CMN003", "未定義の設定キーがあります。")
+    config = {**DEFAULT_CONFIG, **supplied}
+    if config["mode"] not in ("sample", "table"):
+        raise CommonError("CMN003", "modeはsampleまたはtableです。")
+    quote_table_name(config["source_table"])
+    validate_identifier(config["source_column"])
+    validate_identifier(config["output_column"])
+    if config["source_column"].casefold() == config["output_column"].casefold():
+        raise CommonError("CMN005", "原文列と出力列は別の名前にしてください。")
+    for name in ("allow_empty", "write_output"):
+        if type(config[name]) is not bool:
+            raise CommonError("CMN003", f"{name}はJSONのtrue/falseで指定してください。")
+    return config
+
+
+def normalize_text_col(column: Any) -> Any:
+    """Spark組込み関数によるColumn変換。Python UDFは使わない。
+
+    入力は文字列列で、U+0000を含まないことが前提。
+    run_transform_job は型/NULL文字をチェックしてから評価する。
+    Java正規表現は厳密な文字列先頭・末尾アンカーを使用（末尾改行を保持）。
+    """
+    from pyspark.sql import functions as F
+    trimmed = F.regexp_replace(column, r"\A[ \u00A0\u3000]+|[ \u00A0\u3000]+\z", "")
+    return F.regexp_replace(trimmed, '"', '""')
+
+
+def transform_dataframe(df: Any, source_column: str, output_column: str) -> Any:
+    """元列を保持して整形済列を追加。ここではSpark actionを起こさない。"""
+    from pyspark.sql import functions as F
+    from pyspark.sql.types import StringType
+    validate_identifier(source_column)
+    validate_identifier(output_column)
+    lower_names = [name.casefold() for name in df.columns]
+    if len(lower_names) != len(set(lower_names)):
+        raise CommonError("CMN004", "入力DataFrameに曖昧な重複列名があります。")
+    if source_column not in df.columns:
+        raise CommonError("CMN004", "対象列が存在しません。列名の大小文字も確認してください。")
+    if not isinstance(df.schema[source_column].dataType, StringType):
+        raise CommonError("CMN004", "対象列はSpark string型である必要があります。")
+    if output_column.casefold() in lower_names:
+        raise CommonError("CMN005", "出力列が既存列と衝突します。上書きしません。")
+    return df.withColumn(output_column, normalize_text_col(F.col(f"`{source_column}`")))
+
+
+def log_event(level: str, event: str, execution_id: str, **metadata: Any) -> None:
+    """ログに原文/変換値/秘密情報を渡さない。公開メタデータだけを出力。"""
+    print(json.dumps({
+        "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+        "level": level, "event": event, "execution_id": execution_id,
+        "metadata": metadata,
+    }, ensure_ascii=False, allow_nan=False))
+
+
+def run_transform_job(spark: Any, param_json: str, execution_id: str) -> dict[str, Any]:
+    """整形・件数検証・任意の新規Delta出力。既存テーブルは更新しない。"""
+    from pyspark.sql import functions as F
+    from pyspark.sql.types import StringType, StructField, StructType
+    config = parse_config(param_json)
+    validate_execution_id(execution_id)
+    source_col, output_col = config["source_column"], config["output_column"]
+    if config["mode"] == "sample":
+        df = spark.createDataFrame(
+            [(value,) for value in SAMPLE_VALUES],
+            StructType([StructField(source_col, StringType(), True)]),
+        )
+    else:
+        # SQL文字列を組み立てず、検証・引用済みのテーブル識別子を渡す。
+        df = spark.table(quote_table_name(config["source_table"]))
+    output = transform_dataframe(df, source_col, output_col).persist()
+    try:
+        src = F.col(f"`{source_col}`")
+        dst = F.col(f"`{output_col}`")
+        stats = output.agg(
+            F.count(F.lit(1)).alias("row_count"),
+            F.coalesce(F.sum(F.when(~src.eqNullSafe(dst), 1).otherwise(0)), F.lit(0)).alias("changed_count"),
+            F.coalesce(F.sum(F.when(src.isNull(), 1).otherwise(0)), F.lit(0)).alias("null_count"),
+            F.coalesce(F.sum(F.when(F.instr(src, "\x00") > 0, 1).otherwise(0)), F.lit(0)).alias("nul_count"),
+        ).first().asDict()
+        if stats["nul_count"]:
+            raise CommonError("CMN008", "入力にU+0000が含まれています。")
+        if not stats["row_count"] and not config["allow_empty"]:
+            raise CommonError("CMN006", "入力件数が0件です。")
+        output_path = None
+        if config["write_output"]:
+            output_path = f"{OUTPUT_ROOT}/{execution_id}"
+            # 既存パスを上書きしない。同じexecution_idの再実行は運用確認が必要。
+            output.write.format("delta").mode("errorifexists").save(output_path)
+        return {
+            "contract_version": "1.0", "status": "SUCCESS",
+            "execution_id": execution_id, "mode": config["mode"],
+            "row_count": int(stats["row_count"]),
+            "changed_count": int(stats["changed_count"]),
+            "null_count": int(stats["null_count"]),
+            "output_column": output_col, "output_path": output_path,
+            "write_output": config["write_output"], "library_version": COMMON_VERSION,
+        }
+    finally:
+        output.unpersist()
+
+
+def parse_run_result(raw: str, execution_id: str) -> dict[str, Any]:
+    validate_execution_id(execution_id)
+    result = _json_object(raw, "CMN007")
+    required = {"contract_version", "status", "execution_id", "mode", "row_count",
+                "changed_count", "null_count", "output_column", "output_path",
+                "write_output", "library_version"}
+    if set(result) != required:
+        raise CommonError("CMN007", "子Notebookの戻り値項目が契約と一致しません。")
+    if (result["contract_version"] != "1.0" or result["status"] != "SUCCESS"
+            or result["execution_id"] != execution_id
+            or result["library_version"] != COMMON_VERSION):
+        raise CommonError("CMN007", "子Notebookのステータス・実行ID・版が不正です。")
+    if result["mode"] not in ("sample", "table"):
+        raise CommonError("CMN007", "子Notebookのmodeが不正です。")
+    for key in ("row_count", "changed_count", "null_count"):
+        if type(result[key]) is not int or result[key] < 0:
+            raise CommonError("CMN007", "子Notebookの件数が不正です。")
+    if result["changed_count"] + result["null_count"] > result["row_count"]:
+        raise CommonError("CMN007", "子Notebookの件数に整合性がありません。")
+    validate_identifier(result["output_column"])
+    if type(result["write_output"]) is not bool:
+        raise CommonError("CMN007", "子Notebookのwrite_outputが不正です。")
+    expected_path = f"{OUTPUT_ROOT}/{execution_id}" if result["write_output"] else None
+    if result["output_path"] != expected_path:
+        raise CommonError("CMN007", "子Notebookの出力パスが契約と一致しません。")
+    return result
+
+
+def run_common_notebook(
+    runner: Callable[..., str], param_json: str, execution_id: str,
+    timeout_seconds: int = 600,
+) -> dict[str, Any]:
+    """Fabric runnerを注入して親側で検証。例外/タイムアウトを握りつぶさない。"""
+    config = parse_config(param_json)
+    validate_execution_id(execution_id)
+    if type(timeout_seconds) is not int or not 1 <= timeout_seconds <= 43200:
+        raise CommonError("CMN010", "タイムアウトは1～43200秒の整数で指定してください。")
+    raw = runner("NB_CommonTransform", timeout_seconds, {
+        "param_json": json.dumps(config, ensure_ascii=False, allow_nan=False),
+        "execution_id": execution_id,
+    })
+    result = parse_run_result(raw, execution_id)
+    if (result["mode"] != config["mode"] or result["output_column"] != config["output_column"]
+            or result["write_output"] != config["write_output"]):
+        raise CommonError("CMN007", "子Notebookが要求と異なる設定で実行されました。")
+    if not result["row_count"] and not config["allow_empty"]:
+        raise CommonError("CMN006", "子Notebookの処理件数が0件です。")
+    return result
+
+
+==========================================================================================
+FILE: notebooks/NB_CommonReference_Precheck.cells.txt
+==========================================================================================
+# NB_CommonReference_Precheck
+# セル単位でFabric Notebookへコピー。Pythonファイルとしての一括実行は不可。
+
+===== CELL 1: markdown =====
+# ② 別Notebook共通関数の参照呼出し事前検証
+`NB_CommonFunctions`を同一ワークスペースに配置後、PySparkで全セル実行。テーブル更新なし。
+
+===== CELL 2: code =====
+%run NB_CommonFunctions
+
+===== CELL 3: code =====
+import json
+from pyspark.sql import functions as F
+from pyspark.sql.types import StructType, StructField, StringType
+cases = [
+    ('TXT01', None, None),
+    ('TXT02', '', ''),
+    ('TXT03', '   ', ''),
+    ('TXT04', '\u3000\u3000', ''),
+    ('TXT05', '\xa0\xa0', ''),
+    ('TXT06', ' \u3000\xa0製品A\u3000 \xa0', '製品A'),
+    ('TXT07', ' A"B ', 'A""B'),
+    ('TXT08', '""', '""""'),
+    ('TXT09', ' A B\xa0C\u3000D ', 'A B\xa0C\u3000D'),
+    ('TXT10', '\tA\t', '\tA\t'),
+    ('TXT11', '\nA\n', '\nA\n'),
+    ('TXT12', ' A\r\nB ', 'A\r\nB'),
+    ('TXT13', ' A \n', 'A \n'),
+    ('TXT14', '\t A ', '\t A'),
+    ('TXT15', " O'Brien ", "O'Brien"),
+    ('TXT16', ' 😀製品 ', '😀製品'),
+    ('TXT17', '\u2009A\u2009', '\u2009A\u2009'),
+    ('TXT18', ' aBc ', 'aBc'),
+    ('TXT19', ' ＂A＂ ', '＂A＂'),
+    ("TXT20", '"' * 5000, '"' * 10000),
+]
+for case_id, value, expected in cases:
+    actual = normalize_text(value)
+    if actual != expected:
+        raise AssertionError(f"{case_id}: Python結果不一致")
+try:
+    normalize_text(123)
+except CommonError as exc:
+    if exc.code != "CMN001":
+        raise
+else:
+    raise AssertionError("型不正が検出されませんでした")
+for bad in ["tbl;DROP", "a..b", "a.b.c.d", "../x"]:
+    try:
+        quote_table_name(bad)
+    except CommonError:
+        pass
+    else:
+        raise AssertionError("識別子不正が検出されませんでした")
+# 明示schemaでNULL/空文字/長文を同一試験に含める。
+schema = StructType([StructField("case_id", StringType(), False),
+                     StructField("raw", StringType(), True),
+                     StructField("expected", StringType(), True)])
+df = spark.createDataFrame(cases, schema)
+actual_df = transform_dataframe(df, "raw", "actual")
+failures = actual_df.where(~F.col("actual").eqNullSafe(F.col("expected"))).select("case_id").collect()
+if failures:
+    raise AssertionError("Spark結果不一致: " + ",".join(row.case_id for row in failures))
+if normalize_text(normalize_text('"')) != '""""':
+    raise AssertionError("非冪等性の契約不一致")
+print(json.dumps({"status":"PASS", "python_cases":len(cases),
+                  "spark_cases":len(cases), "library_version":COMMON_VERSION},ensure_ascii=False))
+
+
+==========================================================================================
+FILE: notebooks/NB_CommonTransform.cells.txt
+==========================================================================================
+# NB_CommonTransform
+# セル単位でFabric Notebookへコピー。Pythonファイルとしての一括実行は不可。
+
+===== CELL 1: markdown =====
+# ④ 共通処理の呼出先
+同一ワークスペース・同一既定Lakehouseを使用。通常は`NB_ProductItem_Main`から実行。
+
+===== CELL 2: code（パラメータセルとしてマーク） =====
+# このセルを「パラメータとしてマーク」。取込後にUIで確認する。
+param_json = '{"mode":"sample","write_output":false}'
+execution_id = "manual_sample"
+
+===== CELL 3: code =====
+%run NB_CommonFunctions
+
+===== CELL 4: code =====
+import json
+try:
+    validate_execution_id(execution_id)
+    log_event("INFO", "COMMON_START", execution_id)
+    result = run_transform_job(spark, param_json, execution_id)
+    log_event("INFO", "COMMON_END", execution_id, row_count=result["row_count"],
+              changed_count=result["changed_count"], write_output=result["write_output"])
+    result_json = json.dumps(result, ensure_ascii=False, allow_nan=False)
+except Exception as exc:
+    # 原文や例外詳細を通常ログに出さない。Fabricの例外証跡の閲覧権限も管理する。
+    safe_id = execution_id if isinstance(execution_id, str) and len(execution_id) <= 64 else "invalid"
+    log_event("ERROR", "COMMON_FAILED", safe_id, error_type=type(exc).__name__,
+              error_code=getattr(exc, "code", "FABRIC_RUNTIME"))
+    raise
+
+===== CELL 5: code =====
+# exitは独立セルのトップレベル。try/exceptで囲まない。
+notebookutils.notebook.exit(result_json)
+
+
+==========================================================================================
+FILE: notebooks/NB_ProductItem_Main.cells.txt
+==========================================================================================
+# NB_ProductItem_Main
+# セル単位でFabric Notebookへコピー。Pythonファイルとしての一括実行は不可。
+
+===== CELL 1: markdown =====
+# ④ 共通Notebookを呼び出す親Notebook
+既定はサンプル・書込みなし。実テーブル実行時は`config/productitem.json`の内容を`param_json`に設定。`write_output=true`は実行ID別の新規Delta出力を許可する明示指定。
+
+===== CELL 2: code（パラメータセルとしてマーク） =====
+# このセルを「パラメータとしてマーク」。
+param_json = '{"mode":"sample","write_output":false}'
+execution_id = ""
+timeout_seconds = 600
+
+===== CELL 3: code =====
+%run NB_CommonFunctions
+
+===== CELL 4: code =====
+import json
+from uuid import uuid4
+if execution_id == "":
+    execution_id = str(uuid4())
+try:
+    validate_execution_id(execution_id)
+    log_event("INFO", "CALL_START", execution_id)
+    result = run_common_notebook(notebookutils.notebook.run, param_json,
+                                 execution_id, timeout_seconds)
+    # 子の変数を引き継ぐ想定にはしない。出力指定時はDeltaを読み直す。
+    normalized_df = None
+    if result["write_output"]:
+        normalized_df = spark.read.format("delta").load(result["output_path"])
+    log_event("INFO", "CALL_END", execution_id, row_count=result["row_count"],
+              changed_count=result["changed_count"])
+    result_json = json.dumps(result, ensure_ascii=False, allow_nan=False)
+except Exception as exc:
+    safe_id = execution_id if isinstance(execution_id, str) and len(execution_id) <= 64 else "invalid"
+    log_event("ERROR", "CALL_FAILED", safe_id, error_type=type(exc).__name__,
+              error_code=getattr(exc, "code", "FABRIC_RUNTIME"))
+    raise
+
+===== CELL 5: code =====
+# Pipelineへも同じ小さなJSONを返す。DataFrame自体は返さない。
+notebookutils.notebook.exit(result_json)
+
+
+==========================================================================================
+FILE: python/common_functions.py
+==========================================================================================
+"""OneForce 共通関数 v2.0 (Python 3.10+ / Fabric PySpark).
+
+NB_CommonFunctions の実装原本。import/%run 時は定義だけを行う。
+normalize_text は CSV レコード生成でも SQL リテラル化でもない。
+二重引用符の二重化は非冪等のため、未加工の原文に一度だけ適用する。
+"""
+from __future__ import annotations
+
+import json
+import re
+from datetime import datetime, timezone
+from typing import Any, Callable
+
+COMMON_VERSION = "2.0.0"
+TRIM_CHARACTERS = " \u00a0\u3000"
+OUTPUT_ROOT = "Files/oneforce_common/normalized"
+_IDENTIFIER = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,127}\Z")
+_EXECUTION_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}\Z")
+DEFAULT_CONFIG = {
+    "mode": "sample",
+    "source_table": "dbo.jp_dw_dsj_productitem_dim",
+    "source_column": "productitemnamekanji",
+    "output_column": "productitemnamekanji_normalized",
+    "allow_empty": False,
+    "write_output": False,
+}
+SAMPLE_VALUES = [None, "", "  製品A  ", "\u00a0製品B\u3000", '  A"B  ', " A\tB\nC "]
+
+
+class CommonError(ValueError):
+    """コードを保持する検証エラー。業務データ値はメッセージに含めない。"""
+
+    def __init__(self, code: str, message: str) -> None:
+        self.code = code
+        super().__init__(f"{code}: {message}")
+
+
+def normalize_text(value: str | None) -> str | None:
+    """両端の3種類の空白を除去し、ASCII二重引用符だけを二重化する。
+
+    Noneと空文字を区別し、タブ/CR/LFや途中の空白は保持する。
+    str以外を暗黙変換しない。U+0000はSQLとの共通契約の対象外。
+    """
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise CommonError("CMN001", "入力値は文字列またはNoneで指定してください。")
+    if "\x00" in value:
+        raise CommonError("CMN008", "U+0000は入力契約の対象外です。")
+    return value.strip(TRIM_CHARACTERS).replace('"', '""')
+
+
+def validate_identifier(value: str) -> str:
+    """単一識別子。ASCII英字/数字/下線のみ、先頭数字不可、最大128文字。"""
+    if not isinstance(value, str) or _IDENTIFIER.fullmatch(value) is None:
+        raise CommonError("CMN002", "テーブル名・列名の識別子が不正です。")
+    return value
+
+
+def quote_table_name(value: str) -> str:
+    """1～3階層の識別子を検証後、各要素をバッククォートで囲む。
+
+    許可した名前にも引用を施すため予約語が構文として解釈されない。
+    ワークスペース越しの4階層指定、空白、日本語名は本版の対象外。
+    """
+    if not isinstance(value, str):
+        raise CommonError("CMN002", "テーブル名は文字列で指定してください。")
+    parts = value.split(".")
+    if not 1 <= len(parts) <= 3:
+        raise CommonError("CMN002", "テーブル名は1～3階層で指定してください。")
+    return ".".join(f"`{validate_identifier(part)}`" for part in parts)
+
+
+def validate_execution_id(value: str) -> str:
+    if not isinstance(value, str) or _EXECUTION_ID.fullmatch(value) is None:
+        raise CommonError("CMN009", "execution_idは英数字で開始する64文字以内の英数字・_・-で指定してください。")
+    return value
+
+
+def _json_object(text: str, code: str) -> dict[str, Any]:
+    """重複キー/NaN/Infinityを拒否してJSONオブジェクトを読む。"""
+    if not isinstance(text, str) or not text or len(text.encode("utf-8")) > 16384:
+        raise CommonError(code, "JSON文字列は空でなく、UTF-8で16KB以下にしてください。")
+
+    def pairs_hook(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        result: dict[str, Any] = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError("duplicate JSON key")
+            result[key] = value
+        return result
+
+    def reject_constant(value: str) -> None:
+        raise ValueError("non-finite JSON number")
+
+    try:
+        result = json.loads(text, object_pairs_hook=pairs_hook, parse_constant=reject_constant)
+    except (ValueError, TypeError) as exc:
+        raise CommonError(code, "JSON形式が不正です。") from exc
+    if not isinstance(result, dict):
+        raise CommonError(code, "JSONの最上位はオブジェクトにしてください。")
+    return result
+
+
+def parse_config(param_json: str) -> dict[str, Any]:
+    supplied = _json_object(param_json, "CMN003")
+    if set(supplied) - set(DEFAULT_CONFIG):
+        raise CommonError("CMN003", "未定義の設定キーがあります。")
+    config = {**DEFAULT_CONFIG, **supplied}
+    if config["mode"] not in ("sample", "table"):
+        raise CommonError("CMN003", "modeはsampleまたはtableです。")
+    quote_table_name(config["source_table"])
+    validate_identifier(config["source_column"])
+    validate_identifier(config["output_column"])
+    if config["source_column"].casefold() == config["output_column"].casefold():
+        raise CommonError("CMN005", "原文列と出力列は別の名前にしてください。")
+    for name in ("allow_empty", "write_output"):
+        if type(config[name]) is not bool:
+            raise CommonError("CMN003", f"{name}はJSONのtrue/falseで指定してください。")
+    return config
+
+
+def normalize_text_col(column: Any) -> Any:
+    """Spark組込み関数によるColumn変換。Python UDFは使わない。
+
+    入力は文字列列で、U+0000を含まないことが前提。
+    run_transform_job は型/NULL文字をチェックしてから評価する。
+    Java正規表現は厳密な文字列先頭・末尾アンカーを使用（末尾改行を保持）。
+    """
+    from pyspark.sql import functions as F
+    trimmed = F.regexp_replace(column, r"\A[ \u00A0\u3000]+|[ \u00A0\u3000]+\z", "")
+    return F.regexp_replace(trimmed, '"', '""')
+
+
+def transform_dataframe(df: Any, source_column: str, output_column: str) -> Any:
+    """元列を保持して整形済列を追加。ここではSpark actionを起こさない。"""
+    from pyspark.sql import functions as F
+    from pyspark.sql.types import StringType
+    validate_identifier(source_column)
+    validate_identifier(output_column)
+    lower_names = [name.casefold() for name in df.columns]
+    if len(lower_names) != len(set(lower_names)):
+        raise CommonError("CMN004", "入力DataFrameに曖昧な重複列名があります。")
+    if source_column not in df.columns:
+        raise CommonError("CMN004", "対象列が存在しません。列名の大小文字も確認してください。")
+    if not isinstance(df.schema[source_column].dataType, StringType):
+        raise CommonError("CMN004", "対象列はSpark string型である必要があります。")
+    if output_column.casefold() in lower_names:
+        raise CommonError("CMN005", "出力列が既存列と衝突します。上書きしません。")
+    return df.withColumn(output_column, normalize_text_col(F.col(f"`{source_column}`")))
+
+
+def log_event(level: str, event: str, execution_id: str, **metadata: Any) -> None:
+    """ログに原文/変換値/秘密情報を渡さない。公開メタデータだけを出力。"""
+    print(json.dumps({
+        "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+        "level": level, "event": event, "execution_id": execution_id,
+        "metadata": metadata,
+    }, ensure_ascii=False, allow_nan=False))
+
+
+def run_transform_job(spark: Any, param_json: str, execution_id: str) -> dict[str, Any]:
+    """整形・件数検証・任意の新規Delta出力。既存テーブルは更新しない。"""
+    from pyspark.sql import functions as F
+    from pyspark.sql.types import StringType, StructField, StructType
+    config = parse_config(param_json)
+    validate_execution_id(execution_id)
+    source_col, output_col = config["source_column"], config["output_column"]
+    if config["mode"] == "sample":
+        df = spark.createDataFrame(
+            [(value,) for value in SAMPLE_VALUES],
+            StructType([StructField(source_col, StringType(), True)]),
+        )
+    else:
+        # SQL文字列を組み立てず、検証・引用済みのテーブル識別子を渡す。
+        df = spark.table(quote_table_name(config["source_table"]))
+    output = transform_dataframe(df, source_col, output_col).persist()
+    try:
+        src = F.col(f"`{source_col}`")
+        dst = F.col(f"`{output_col}`")
+        stats = output.agg(
+            F.count(F.lit(1)).alias("row_count"),
+            F.coalesce(F.sum(F.when(~src.eqNullSafe(dst), 1).otherwise(0)), F.lit(0)).alias("changed_count"),
+            F.coalesce(F.sum(F.when(src.isNull(), 1).otherwise(0)), F.lit(0)).alias("null_count"),
+            F.coalesce(F.sum(F.when(F.instr(src, "\x00") > 0, 1).otherwise(0)), F.lit(0)).alias("nul_count"),
+        ).first().asDict()
+        if stats["nul_count"]:
+            raise CommonError("CMN008", "入力にU+0000が含まれています。")
+        if not stats["row_count"] and not config["allow_empty"]:
+            raise CommonError("CMN006", "入力件数が0件です。")
+        output_path = None
+        if config["write_output"]:
+            output_path = f"{OUTPUT_ROOT}/{execution_id}"
+            # 既存パスを上書きしない。同じexecution_idの再実行は運用確認が必要。
+            output.write.format("delta").mode("errorifexists").save(output_path)
+        return {
+            "contract_version": "1.0", "status": "SUCCESS",
+            "execution_id": execution_id, "mode": config["mode"],
+            "row_count": int(stats["row_count"]),
+            "changed_count": int(stats["changed_count"]),
+            "null_count": int(stats["null_count"]),
+            "output_column": output_col, "output_path": output_path,
+            "write_output": config["write_output"], "library_version": COMMON_VERSION,
+        }
+    finally:
+        output.unpersist()
+
+
+def parse_run_result(raw: str, execution_id: str) -> dict[str, Any]:
+    validate_execution_id(execution_id)
+    result = _json_object(raw, "CMN007")
+    required = {"contract_version", "status", "execution_id", "mode", "row_count",
+                "changed_count", "null_count", "output_column", "output_path",
+                "write_output", "library_version"}
+    if set(result) != required:
+        raise CommonError("CMN007", "子Notebookの戻り値項目が契約と一致しません。")
+    if (result["contract_version"] != "1.0" or result["status"] != "SUCCESS"
+            or result["execution_id"] != execution_id
+            or result["library_version"] != COMMON_VERSION):
+        raise CommonError("CMN007", "子Notebookのステータス・実行ID・版が不正です。")
+    if result["mode"] not in ("sample", "table"):
+        raise CommonError("CMN007", "子Notebookのmodeが不正です。")
+    for key in ("row_count", "changed_count", "null_count"):
+        if type(result[key]) is not int or result[key] < 0:
+            raise CommonError("CMN007", "子Notebookの件数が不正です。")
+    if result["changed_count"] + result["null_count"] > result["row_count"]:
+        raise CommonError("CMN007", "子Notebookの件数に整合性がありません。")
+    validate_identifier(result["output_column"])
+    if type(result["write_output"]) is not bool:
+        raise CommonError("CMN007", "子Notebookのwrite_outputが不正です。")
+    expected_path = f"{OUTPUT_ROOT}/{execution_id}" if result["write_output"] else None
+    if result["output_path"] != expected_path:
+        raise CommonError("CMN007", "子Notebookの出力パスが契約と一致しません。")
+    return result
+
+
+def run_common_notebook(
+    runner: Callable[..., str], param_json: str, execution_id: str,
+    timeout_seconds: int = 600,
+) -> dict[str, Any]:
+    """Fabric runnerを注入して親側で検証。例外/タイムアウトを握りつぶさない。"""
+    config = parse_config(param_json)
+    validate_execution_id(execution_id)
+    if type(timeout_seconds) is not int or not 1 <= timeout_seconds <= 43200:
+        raise CommonError("CMN010", "タイムアウトは1～43200秒の整数で指定してください。")
+    raw = runner("NB_CommonTransform", timeout_seconds, {
+        "param_json": json.dumps(config, ensure_ascii=False, allow_nan=False),
+        "execution_id": execution_id,
+    })
+    result = parse_run_result(raw, execution_id)
+    if (result["mode"] != config["mode"] or result["output_column"] != config["output_column"]
+            or result["write_output"] != config["write_output"]):
+        raise CommonError("CMN007", "子Notebookが要求と異なる設定で実行されました。")
+    if not result["row_count"] and not config["allow_empty"]:
+        raise CommonError("CMN006", "子Notebookの処理件数が0件です。")
+    return result
+
+
+==========================================================================================
+FILE: sql/01_precheck/00_environment.sql
+==========================================================================================
+-- OneForce / Microsoft Fabric T-SQL / v2.0 / 2026-11-05
+-- 対象: GoldLakehouse SQL分析エンドポイント、または同一ソースを持つWarehouse。
+-- Spark SQLセルでは実行しない。接続先DBを確認し、このファイルを1バッチで実行。
+-- UTF-8 DB照合順序、スカラーUDF、varchar(max)対応が前提。
+-- 元データのU+0000は入力契約外。元データへのDMLは行わない。
+
+SET NOCOUNT ON;
+SELECT DB_NAME() AS database_name, @@VERSION AS engine_version,
+       CONVERT(varchar(128), DATABASEPROPERTYEX(DB_NAME(), 'Collation')) AS database_collation;
+DECLARE @collation varchar(128) =
+    CONVERT(varchar(128), DATABASEPROPERTYEX(DB_NAME(), 'Collation'));
+IF @collation IS NULL OR @collation NOT LIKE '%UTF8'
+    THROW 51001, N'UTF-8のDB照合順序が必要です。接続先を確認してください。', 1;
+
+-- scalar UDF本体とは別の環境検査。NULLは権限不足/メタデータ不可視の可能性がある。
+SELECT HAS_PERMS_BY_NAME(DB_NAME(), 'DATABASE', 'CREATE FUNCTION') AS can_create_function,
+       HAS_PERMS_BY_NAME('dbo', 'SCHEMA', 'ALTER') AS can_alter_schema;
+
+-- 型の式評価テストだけでendpointの元列切捨てがないことは証明できない。
+DECLARE @wide varchar(max) = REPLICATE(CAST('X' AS varchar(max)), 10000);
+IF DATALENGTH(@wide) <> 10000
+    THROW 51002, N'長文の評価結果が想定と異なります。varchar(max)対応を確認してください。', 1;
+SELECT DATALENGTH(@wide) AS long_string_bytes;
+
+SELECT s.name AS schema_name, o.name AS object_name,
+       c.name AS column_name, t.name AS data_type, c.max_length, c.collation_name
+FROM sys.objects AS o
+JOIN sys.schemas AS s ON s.schema_id = o.schema_id
+JOIN sys.columns AS c ON c.object_id = o.object_id
+JOIN sys.types AS t ON t.user_type_id = c.user_type_id
+WHERE s.name = 'dbo' AND o.name = 'jp_dw_dsj_productitem_dim'
+  AND c.name = 'productitemnamekanji';
+-- 元列が未同期/不可視でもここは0行となる。実テーブル検証03で判定する。
+-- endpointの新メタデータ同期有効化、Preview利用許可は管理者が別途確認する。
+
+
+==========================================================================================
+FILE: sql/01_precheck/01_create_probe.sql
+==========================================================================================
+-- OneForce / Microsoft Fabric T-SQL / v2.0 / 2026-11-05
+-- 対象: GoldLakehouse SQL分析エンドポイント、または同一ソースを持つWarehouse。
+-- Spark SQLセルでは実行しない。接続先DBを確認し、このファイルを1バッチで実行。
+-- UTF-8 DB照合順序、スカラーUDF、varchar(max)対応が前提。
+-- 元データのU+0000は入力契約外。元データへのDMLは行わない。
+-- 検証専用名。既存オブジェクトが本パッケージ所有であることを事前確認する。
+CREATE OR ALTER FUNCTION dbo.fn_NormalizeText_Precheck (@InputText varchar(max))
+RETURNS varchar(max)
+WITH SCHEMABINDING
+AS
+BEGIN
+    RETURN REPLACE(
+        TRIM(
+            CAST((N' ' + NCHAR(160) + NCHAR(12288))
+                 COLLATE Latin1_General_100_BIN2_UTF8 AS varchar(6))
+            FROM @InputText COLLATE Latin1_General_100_BIN2_UTF8
+        ),
+        '"', '""'
+    );
+END;
+
+
+==========================================================================================
+FILE: sql/01_precheck/02_scalar_tests.sql
+==========================================================================================
+-- OneForce / Microsoft Fabric T-SQL / v2.0 / 2026-11-05
+-- 対象: GoldLakehouse SQL分析エンドポイント、または同一ソースを持つWarehouse。
+-- Spark SQLセルでは実行しない。接続先DBを確認し、このファイルを1バッチで実行。
+-- UTF-8 DB照合順序、スカラーUDF、varchar(max)対応が前提。
+-- 元データのU+0000は入力契約外。元データへのDMLは行わない。
+
+SET NOCOUNT ON;
+DECLARE @actual varchar(max), @expected varchar(max);
+
+-- TXT01: NULL
+SET @actual = dbo.fn_NormalizeText_Precheck(CAST(NULL AS varchar(max)));
+SET @expected = CAST(NULL AS varchar(max));
+IF (@actual IS NULL AND @expected IS NOT NULL)
+   OR (@actual IS NOT NULL AND @expected IS NULL)
+   OR (@actual IS NOT NULL AND @expected IS NOT NULL AND (
+       DATALENGTH(@actual) <> DATALENGTH(@expected)
+       OR @actual COLLATE Latin1_General_100_BIN2_UTF8 <> @expected COLLATE Latin1_General_100_BIN2_UTF8))
+    THROW 51010, N'TXT01: 期待値不一致', 1;
+SELECT 'TXT01' AS case_id, 'PASS' AS status, DATALENGTH(@actual) AS result_bytes;
+
+-- TXT02: 空文字
+SET @actual = dbo.fn_NormalizeText_Precheck(CAST((N'') COLLATE Latin1_General_100_BIN2_UTF8 AS varchar(max)));
+SET @expected = CAST((N'') COLLATE Latin1_General_100_BIN2_UTF8 AS varchar(max));
+IF (@actual IS NULL AND @expected IS NOT NULL)
+   OR (@actual IS NOT NULL AND @expected IS NULL)
+   OR (@actual IS NOT NULL AND @expected IS NOT NULL AND (
+       DATALENGTH(@actual) <> DATALENGTH(@expected)
+       OR @actual COLLATE Latin1_General_100_BIN2_UTF8 <> @expected COLLATE Latin1_General_100_BIN2_UTF8))
+    THROW 51010, N'TXT02: 期待値不一致', 1;
+SELECT 'TXT02' AS case_id, 'PASS' AS status, DATALENGTH(@actual) AS result_bytes;
+
+-- TXT03: 半角空白のみ
+SET @actual = dbo.fn_NormalizeText_Precheck(CAST((N'   ') COLLATE Latin1_General_100_BIN2_UTF8 AS varchar(max)));
+SET @expected = CAST((N'') COLLATE Latin1_General_100_BIN2_UTF8 AS varchar(max));
+IF (@actual IS NULL AND @expected IS NOT NULL)
+   OR (@actual IS NOT NULL AND @expected IS NULL)
+   OR (@actual IS NOT NULL AND @expected IS NOT NULL AND (
+       DATALENGTH(@actual) <> DATALENGTH(@expected)
+       OR @actual COLLATE Latin1_General_100_BIN2_UTF8 <> @expected COLLATE Latin1_General_100_BIN2_UTF8))
+    THROW 51010, N'TXT03: 期待値不一致', 1;
+SELECT 'TXT03' AS case_id, 'PASS' AS status, DATALENGTH(@actual) AS result_bytes;
+
+-- TXT04: 全角空白のみ
+SET @actual = dbo.fn_NormalizeText_Precheck(CAST((NCHAR(12288) + NCHAR(12288)) COLLATE Latin1_General_100_BIN2_UTF8 AS varchar(max)));
+SET @expected = CAST((N'') COLLATE Latin1_General_100_BIN2_UTF8 AS varchar(max));
+IF (@actual IS NULL AND @expected IS NOT NULL)
+   OR (@actual IS NOT NULL AND @expected IS NULL)
+   OR (@actual IS NOT NULL AND @expected IS NOT NULL AND (
+       DATALENGTH(@actual) <> DATALENGTH(@expected)
+       OR @actual COLLATE Latin1_General_100_BIN2_UTF8 <> @expected COLLATE Latin1_General_100_BIN2_UTF8))
+    THROW 51010, N'TXT04: 期待値不一致', 1;
+SELECT 'TXT04' AS case_id, 'PASS' AS status, DATALENGTH(@actual) AS result_bytes;
+
+-- TXT05: NBSPのみ
+SET @actual = dbo.fn_NormalizeText_Precheck(CAST((NCHAR(160) + NCHAR(160)) COLLATE Latin1_General_100_BIN2_UTF8 AS varchar(max)));
+SET @expected = CAST((N'') COLLATE Latin1_General_100_BIN2_UTF8 AS varchar(max));
+IF (@actual IS NULL AND @expected IS NOT NULL)
+   OR (@actual IS NOT NULL AND @expected IS NULL)
+   OR (@actual IS NOT NULL AND @expected IS NOT NULL AND (
+       DATALENGTH(@actual) <> DATALENGTH(@expected)
+       OR @actual COLLATE Latin1_General_100_BIN2_UTF8 <> @expected COLLATE Latin1_General_100_BIN2_UTF8))
+    THROW 51010, N'TXT05: 期待値不一致', 1;
+SELECT 'TXT05' AS case_id, 'PASS' AS status, DATALENGTH(@actual) AS result_bytes;
+
+-- TXT06: 混在した前後空白
+SET @actual = dbo.fn_NormalizeText_Precheck(CAST((N' ' + NCHAR(12288) + NCHAR(160) + N'製品A' + NCHAR(12288) + N' ' + NCHAR(160)) COLLATE Latin1_General_100_BIN2_UTF8 AS varchar(max)));
+SET @expected = CAST((N'製品A') COLLATE Latin1_General_100_BIN2_UTF8 AS varchar(max));
+IF (@actual IS NULL AND @expected IS NOT NULL)
+   OR (@actual IS NOT NULL AND @expected IS NULL)
+   OR (@actual IS NOT NULL AND @expected IS NOT NULL AND (
+       DATALENGTH(@actual) <> DATALENGTH(@expected)
+       OR @actual COLLATE Latin1_General_100_BIN2_UTF8 <> @expected COLLATE Latin1_General_100_BIN2_UTF8))
+    THROW 51010, N'TXT06: 期待値不一致', 1;
+SELECT 'TXT06' AS case_id, 'PASS' AS status, DATALENGTH(@actual) AS result_bytes;
+
+-- TXT07: 引用符
+SET @actual = dbo.fn_NormalizeText_Precheck(CAST((N' A"B ') COLLATE Latin1_General_100_BIN2_UTF8 AS varchar(max)));
+SET @expected = CAST((N'A""B') COLLATE Latin1_General_100_BIN2_UTF8 AS varchar(max));
+IF (@actual IS NULL AND @expected IS NOT NULL)
+   OR (@actual IS NOT NULL AND @expected IS NULL)
+   OR (@actual IS NOT NULL AND @expected IS NOT NULL AND (
+       DATALENGTH(@actual) <> DATALENGTH(@expected)
+       OR @actual COLLATE Latin1_General_100_BIN2_UTF8 <> @expected COLLATE Latin1_General_100_BIN2_UTF8))
+    THROW 51010, N'TXT07: 期待値不一致', 1;
+SELECT 'TXT07' AS case_id, 'PASS' AS status, DATALENGTH(@actual) AS result_bytes;
+
+-- TXT08: 連続引用符
+SET @actual = dbo.fn_NormalizeText_Precheck(CAST((N'""') COLLATE Latin1_General_100_BIN2_UTF8 AS varchar(max)));
+SET @expected = CAST((N'""""') COLLATE Latin1_General_100_BIN2_UTF8 AS varchar(max));
+IF (@actual IS NULL AND @expected IS NOT NULL)
+   OR (@actual IS NOT NULL AND @expected IS NULL)
+   OR (@actual IS NOT NULL AND @expected IS NOT NULL AND (
+       DATALENGTH(@actual) <> DATALENGTH(@expected)
+       OR @actual COLLATE Latin1_General_100_BIN2_UTF8 <> @expected COLLATE Latin1_General_100_BIN2_UTF8))
+    THROW 51010, N'TXT08: 期待値不一致', 1;
+SELECT 'TXT08' AS case_id, 'PASS' AS status, DATALENGTH(@actual) AS result_bytes;
+
+-- TXT09: 内部空白保持
+SET @actual = dbo.fn_NormalizeText_Precheck(CAST((N' A B' + NCHAR(160) + N'C' + NCHAR(12288) + N'D ') COLLATE Latin1_General_100_BIN2_UTF8 AS varchar(max)));
+SET @expected = CAST((N'A B' + NCHAR(160) + N'C' + NCHAR(12288) + N'D') COLLATE Latin1_General_100_BIN2_UTF8 AS varchar(max));
+IF (@actual IS NULL AND @expected IS NOT NULL)
+   OR (@actual IS NOT NULL AND @expected IS NULL)
+   OR (@actual IS NOT NULL AND @expected IS NOT NULL AND (
+       DATALENGTH(@actual) <> DATALENGTH(@expected)
+       OR @actual COLLATE Latin1_General_100_BIN2_UTF8 <> @expected COLLATE Latin1_General_100_BIN2_UTF8))
+    THROW 51010, N'TXT09: 期待値不一致', 1;
+SELECT 'TXT09' AS case_id, 'PASS' AS status, DATALENGTH(@actual) AS result_bytes;
+
+-- TXT10: タブ保持
+SET @actual = dbo.fn_NormalizeText_Precheck(CAST((NCHAR(9) + N'A' + NCHAR(9)) COLLATE Latin1_General_100_BIN2_UTF8 AS varchar(max)));
+SET @expected = CAST((NCHAR(9) + N'A' + NCHAR(9)) COLLATE Latin1_General_100_BIN2_UTF8 AS varchar(max));
+IF (@actual IS NULL AND @expected IS NOT NULL)
+   OR (@actual IS NOT NULL AND @expected IS NULL)
+   OR (@actual IS NOT NULL AND @expected IS NOT NULL AND (
+       DATALENGTH(@actual) <> DATALENGTH(@expected)
+       OR @actual COLLATE Latin1_General_100_BIN2_UTF8 <> @expected COLLATE Latin1_General_100_BIN2_UTF8))
+    THROW 51010, N'TXT10: 期待値不一致', 1;
+SELECT 'TXT10' AS case_id, 'PASS' AS status, DATALENGTH(@actual) AS result_bytes;
+
+-- TXT11: 改行保持
+SET @actual = dbo.fn_NormalizeText_Precheck(CAST((NCHAR(10) + N'A' + NCHAR(10)) COLLATE Latin1_General_100_BIN2_UTF8 AS varchar(max)));
+SET @expected = CAST((NCHAR(10) + N'A' + NCHAR(10)) COLLATE Latin1_General_100_BIN2_UTF8 AS varchar(max));
+IF (@actual IS NULL AND @expected IS NOT NULL)
+   OR (@actual IS NOT NULL AND @expected IS NULL)
+   OR (@actual IS NOT NULL AND @expected IS NOT NULL AND (
+       DATALENGTH(@actual) <> DATALENGTH(@expected)
+       OR @actual COLLATE Latin1_General_100_BIN2_UTF8 <> @expected COLLATE Latin1_General_100_BIN2_UTF8))
+    THROW 51010, N'TXT11: 期待値不一致', 1;
+SELECT 'TXT11' AS case_id, 'PASS' AS status, DATALENGTH(@actual) AS result_bytes;
+
+-- TXT12: CRLF保持
+SET @actual = dbo.fn_NormalizeText_Precheck(CAST((N' A' + NCHAR(13) + NCHAR(10) + N'B ') COLLATE Latin1_General_100_BIN2_UTF8 AS varchar(max)));
+SET @expected = CAST((N'A' + NCHAR(13) + NCHAR(10) + N'B') COLLATE Latin1_General_100_BIN2_UTF8 AS varchar(max));
+IF (@actual IS NULL AND @expected IS NOT NULL)
+   OR (@actual IS NOT NULL AND @expected IS NULL)
+   OR (@actual IS NOT NULL AND @expected IS NOT NULL AND (
+       DATALENGTH(@actual) <> DATALENGTH(@expected)
+       OR @actual COLLATE Latin1_General_100_BIN2_UTF8 <> @expected COLLATE Latin1_General_100_BIN2_UTF8))
+    THROW 51010, N'TXT12: 期待値不一致', 1;
+SELECT 'TXT12' AS case_id, 'PASS' AS status, DATALENGTH(@actual) AS result_bytes;
+
+-- TXT13: 最終改行の直前空白を保持
+SET @actual = dbo.fn_NormalizeText_Precheck(CAST((N' A ' + NCHAR(10)) COLLATE Latin1_General_100_BIN2_UTF8 AS varchar(max)));
+SET @expected = CAST((N'A ' + NCHAR(10)) COLLATE Latin1_General_100_BIN2_UTF8 AS varchar(max));
+IF (@actual IS NULL AND @expected IS NOT NULL)
+   OR (@actual IS NOT NULL AND @expected IS NULL)
+   OR (@actual IS NOT NULL AND @expected IS NOT NULL AND (
+       DATALENGTH(@actual) <> DATALENGTH(@expected)
+       OR @actual COLLATE Latin1_General_100_BIN2_UTF8 <> @expected COLLATE Latin1_General_100_BIN2_UTF8))
+    THROW 51010, N'TXT13: 期待値不一致', 1;
+SELECT 'TXT13' AS case_id, 'PASS' AS status, DATALENGTH(@actual) AS result_bytes;
+
+-- TXT14: 先頭タブ直後の空白を保持
+SET @actual = dbo.fn_NormalizeText_Precheck(CAST((NCHAR(9) + N' A ') COLLATE Latin1_General_100_BIN2_UTF8 AS varchar(max)));
+SET @expected = CAST((NCHAR(9) + N' A') COLLATE Latin1_General_100_BIN2_UTF8 AS varchar(max));
+IF (@actual IS NULL AND @expected IS NOT NULL)
+   OR (@actual IS NOT NULL AND @expected IS NULL)
+   OR (@actual IS NOT NULL AND @expected IS NOT NULL AND (
+       DATALENGTH(@actual) <> DATALENGTH(@expected)
+       OR @actual COLLATE Latin1_General_100_BIN2_UTF8 <> @expected COLLATE Latin1_General_100_BIN2_UTF8))
+    THROW 51010, N'TXT14: 期待値不一致', 1;
+SELECT 'TXT14' AS case_id, 'PASS' AS status, DATALENGTH(@actual) AS result_bytes;
+
+-- TXT15: シングルクォート保持
+SET @actual = dbo.fn_NormalizeText_Precheck(CAST((N' O''Brien ') COLLATE Latin1_General_100_BIN2_UTF8 AS varchar(max)));
+SET @expected = CAST((N'O''Brien') COLLATE Latin1_General_100_BIN2_UTF8 AS varchar(max));
+IF (@actual IS NULL AND @expected IS NOT NULL)
+   OR (@actual IS NOT NULL AND @expected IS NULL)
+   OR (@actual IS NOT NULL AND @expected IS NOT NULL AND (
+       DATALENGTH(@actual) <> DATALENGTH(@expected)
+       OR @actual COLLATE Latin1_General_100_BIN2_UTF8 <> @expected COLLATE Latin1_General_100_BIN2_UTF8))
+    THROW 51010, N'TXT15: 期待値不一致', 1;
+SELECT 'TXT15' AS case_id, 'PASS' AS status, DATALENGTH(@actual) AS result_bytes;
+
+-- TXT16: 絵文字
+SET @actual = dbo.fn_NormalizeText_Precheck(CAST((N' 😀製品 ') COLLATE Latin1_General_100_BIN2_UTF8 AS varchar(max)));
+SET @expected = CAST((N'😀製品') COLLATE Latin1_General_100_BIN2_UTF8 AS varchar(max));
+IF (@actual IS NULL AND @expected IS NOT NULL)
+   OR (@actual IS NOT NULL AND @expected IS NULL)
+   OR (@actual IS NOT NULL AND @expected IS NOT NULL AND (
+       DATALENGTH(@actual) <> DATALENGTH(@expected)
+       OR @actual COLLATE Latin1_General_100_BIN2_UTF8 <> @expected COLLATE Latin1_General_100_BIN2_UTF8))
+    THROW 51010, N'TXT16: 期待値不一致', 1;
+SELECT 'TXT16' AS case_id, 'PASS' AS status, DATALENGTH(@actual) AS result_bytes;
+
+-- TXT17: 除去対象外の細い空白
+SET @actual = dbo.fn_NormalizeText_Precheck(CAST((NCHAR(8201) + N'A' + NCHAR(8201)) COLLATE Latin1_General_100_BIN2_UTF8 AS varchar(max)));
+SET @expected = CAST((NCHAR(8201) + N'A' + NCHAR(8201)) COLLATE Latin1_General_100_BIN2_UTF8 AS varchar(max));
+IF (@actual IS NULL AND @expected IS NOT NULL)
+   OR (@actual IS NOT NULL AND @expected IS NULL)
+   OR (@actual IS NOT NULL AND @expected IS NOT NULL AND (
+       DATALENGTH(@actual) <> DATALENGTH(@expected)
+       OR @actual COLLATE Latin1_General_100_BIN2_UTF8 <> @expected COLLATE Latin1_General_100_BIN2_UTF8))
+    THROW 51010, N'TXT17: 期待値不一致', 1;
+SELECT 'TXT17' AS case_id, 'PASS' AS status, DATALENGTH(@actual) AS result_bytes;
+
+-- TXT18: 大小文字保持
+SET @actual = dbo.fn_NormalizeText_Precheck(CAST((N' aBc ') COLLATE Latin1_General_100_BIN2_UTF8 AS varchar(max)));
+SET @expected = CAST((N'aBc') COLLATE Latin1_General_100_BIN2_UTF8 AS varchar(max));
+IF (@actual IS NULL AND @expected IS NOT NULL)
+   OR (@actual IS NOT NULL AND @expected IS NULL)
+   OR (@actual IS NOT NULL AND @expected IS NOT NULL AND (
+       DATALENGTH(@actual) <> DATALENGTH(@expected)
+       OR @actual COLLATE Latin1_General_100_BIN2_UTF8 <> @expected COLLATE Latin1_General_100_BIN2_UTF8))
+    THROW 51010, N'TXT18: 期待値不一致', 1;
+SELECT 'TXT18' AS case_id, 'PASS' AS status, DATALENGTH(@actual) AS result_bytes;
+
+-- TXT19: 全角二重引用符保持
+SET @actual = dbo.fn_NormalizeText_Precheck(CAST((N' ＂A＂ ') COLLATE Latin1_General_100_BIN2_UTF8 AS varchar(max)));
+SET @expected = CAST((N'＂A＂') COLLATE Latin1_General_100_BIN2_UTF8 AS varchar(max));
+IF (@actual IS NULL AND @expected IS NOT NULL)
+   OR (@actual IS NOT NULL AND @expected IS NULL)
+   OR (@actual IS NOT NULL AND @expected IS NOT NULL AND (
+       DATALENGTH(@actual) <> DATALENGTH(@expected)
+       OR @actual COLLATE Latin1_General_100_BIN2_UTF8 <> @expected COLLATE Latin1_General_100_BIN2_UTF8))
+    THROW 51010, N'TXT19: 期待値不一致', 1;
+SELECT 'TXT19' AS case_id, 'PASS' AS status, DATALENGTH(@actual) AS result_bytes;
+
+-- TXT20: 8000バイト超の引用符展開
+SET @actual = dbo.fn_NormalizeText_Precheck(REPLICATE(CAST('"' AS varchar(max)), 5000));
+SET @expected = REPLICATE(CAST('"' AS varchar(max)), 10000);
+IF (@actual IS NULL AND @expected IS NOT NULL)
+   OR (@actual IS NOT NULL AND @expected IS NULL)
+   OR (@actual IS NOT NULL AND @expected IS NOT NULL AND (
+       DATALENGTH(@actual) <> DATALENGTH(@expected)
+       OR @actual COLLATE Latin1_General_100_BIN2_UTF8 <> @expected COLLATE Latin1_General_100_BIN2_UTF8))
+    THROW 51010, N'TXT20: 期待値不一致', 1;
+SELECT 'TXT20' AS case_id, 'PASS' AS status, DATALENGTH(@actual) AS result_bytes;
+
+-- TXT21: 再適用により引用符が更に二重化される（非冪等）。
+IF dbo.fn_NormalizeText_Precheck(dbo.fn_NormalizeText_Precheck('"')) <> '""""'
+    THROW 51010, N'TXT21: 非冪等性の期待値不一致', 1;
+SELECT 'TXT21' AS case_id, 'PASS' AS status;
+SELECT 'ALL_PASS' AS summary, 21 AS test_count;
+
+
+==========================================================================================
+FILE: sql/01_precheck/03_table_call_test.sql
+==========================================================================================
+-- OneForce / Microsoft Fabric T-SQL / v2.0 / 2026-11-05
+-- 対象: GoldLakehouse SQL分析エンドポイント、または同一ソースを持つWarehouse。
+-- Spark SQLセルでは実行しない。接続先DBを確認し、このファイルを1バッチで実行。
+-- UTF-8 DB照合順序、スカラーUDF、varchar(max)対応が前提。
+-- 元データのU+0000は入力契約外。元データへのDMLは行わない。
+
+SET NOCOUNT ON;
+IF OBJECT_ID(N'dbo.fn_NormalizeText_Precheck', N'FN') IS NULL
+    THROW 51003, N'検証用Functionが存在しないか、参照権限がありません。', 1;
+IF OBJECT_ID(N'dbo.jp_dw_dsj_productitem_dim') IS NULL
+    THROW 51004, N'対象テーブルが存在しないか、参照権限がありません。', 1;
+IF NOT EXISTS (SELECT 1 FROM sys.columns
+               WHERE object_id = OBJECT_ID(N'dbo.jp_dw_dsj_productitem_dim')
+                 AND name = N'productitemnamekanji')
+    THROW 51005, N'対象列が存在しないか、メタデータが不可視です。', 1;
+SELECT o.name, m.is_inlineable
+FROM sys.objects AS o JOIN sys.sql_modules AS m ON m.object_id = o.object_id
+WHERE o.object_id = OBJECT_ID(N'dbo.fn_NormalizeText_Precheck');
+
+-- 定数SELECT成功だけでなく、実テーブルで分散実行できることを確認する。
+-- 生データは証跡に出さず、長さだけを出力。0件の場合は事前検証未完了扱い。
+SELECT TOP (100)
+    DATALENGTH(productitemnamekanji) AS input_bytes,
+    DATALENGTH(dbo.fn_NormalizeText_Precheck(productitemnamekanji)) AS output_bytes
+FROM dbo.jp_dw_dsj_productitem_dim;
+IF @@ROWCOUNT = 0
+    THROW 51006, N'対象テーブルが0件です。非空の検証データで再実施してください。', 1;
+-- これはスモーク試験。全量性能は実件数・容量・SLAを確定して測定する。
+
+
+==========================================================================================
+FILE: sql/01_precheck/09_cleanup_probe.sql
+==========================================================================================
+-- OneForce / Microsoft Fabric T-SQL / v2.0 / 2026-11-05
+-- 対象: GoldLakehouse SQL分析エンドポイント、または同一ソースを持つWarehouse。
+-- Spark SQLセルでは実行しない。接続先DBを確認し、このファイルを1バッチで実行。
+-- UTF-8 DB照合順序、スカラーUDF、varchar(max)対応が前提。
+-- 元データのU+0000は入力契約外。元データへのDMLは行わない。
+
+-- 明示的な手動後片付け。検証証跡を保存し、この名前の所有者を確認してから実行する。
+-- 正式Function/Viewや業務テーブルには作用しない。
+DROP FUNCTION IF EXISTS dbo.fn_NormalizeText_Precheck;
+
+
+==========================================================================================
+FILE: sql/03_common/00_prerequisites.sql
+==========================================================================================
+-- OneForce / Microsoft Fabric T-SQL / v2.0 / 2026-11-05
+-- 対象: GoldLakehouse SQL分析エンドポイント、または同一ソースを持つWarehouse。
+-- Spark SQLセルでは実行しない。接続先DBを確認し、このファイルを1バッチで実行。
+-- UTF-8 DB照合順序、スカラーUDF、varchar(max)対応が前提。
+-- 元データのU+0000は入力契約外。元データへのDMLは行わない。
+
+SET NOCOUNT ON;
+IF OBJECT_ID(N'dbo.jp_dw_dsj_productitem_dim') IS NULL
+    THROW 51004, N'対象テーブルが存在しないか、参照権限がありません。', 1;
+IF NOT EXISTS (
+    SELECT 1 FROM sys.columns AS c JOIN sys.types AS t ON t.user_type_id=c.user_type_id
+    WHERE c.object_id=OBJECT_ID(N'dbo.jp_dw_dsj_productitem_dim')
+      AND c.name=N'productitemnamekanji' AND t.name IN ('char','varchar')
+)
+    THROW 51005, N'対象列が存在しないか、対応する文字列型ではありません。', 1;
+SELECT HAS_PERMS_BY_NAME(DB_NAME(), 'DATABASE', 'CREATE VIEW') AS can_create_view,
+       HAS_PERMS_BY_NAME('dbo.jp_dw_dsj_productitem_dim', 'OBJECT', 'SELECT') AS can_select_source;
+-- オブジェクト名/全項目/PKは実DDLと照合する。本版Viewは確認済みの1原文列だけを投影する。
+
+
+==========================================================================================
+FILE: sql/03_common/10_fn_NormalizeText.sql
+==========================================================================================
+-- OneForce / Microsoft Fabric T-SQL / v2.0 / 2026-11-05
+-- 対象: GoldLakehouse SQL分析エンドポイント、または同一ソースを持つWarehouse。
+-- Spark SQLセルでは実行しない。接続先DBを確認し、このファイルを1バッチで実行。
+-- UTF-8 DB照合順序、スカラーUDF、varchar(max)対応が前提。
+-- 元データのU+0000は入力契約外。元データへのDMLは行わない。
+-- 正式版。変更前の定義/権限を退避し、レビュー後に適用する。
+-- 前後U+0020/U+00A0/U+3000を除去、ASCII二重引用符を二重化。
+-- NULL/空文字/内部空白/タブ/CR/LF/大小文字を維持。非冪等のため原文に一度だけ適用。
+CREATE OR ALTER FUNCTION dbo.fn_NormalizeText (@InputText varchar(max))
+RETURNS varchar(max)
+WITH SCHEMABINDING
+AS
+BEGIN
+    RETURN REPLACE(
+        TRIM(
+            CAST((N' ' + NCHAR(160) + NCHAR(12288))
+                 COLLATE Latin1_General_100_BIN2_UTF8 AS varchar(6))
+            FROM @InputText COLLATE Latin1_General_100_BIN2_UTF8
+        ),
+        '"', '""'
+    );
+END;
+
+
+==========================================================================================
+FILE: sql/03_common/20_vw_ProductItem_Normalized.sql
+==========================================================================================
+-- OneForce / Microsoft Fabric T-SQL / v2.0 / 2026-11-05
+-- 対象: GoldLakehouse SQL分析エンドポイント、または同一ソースを持つWarehouse。
+-- Spark SQLセルでは実行しない。接続先DBを確認し、このファイルを1バッチで実行。
+-- UTF-8 DB照合順序、スカラーUDF、varchar(max)対応が前提。
+-- 元データのU+0000は入力契約外。元データへのDMLは行わない。
+
+-- 最小の共通View。元列と整形列の2列のみ。未提示のPKやDataverse差分列は創作しない。
+-- 連携本体で利用するときは、PK/必要列を実テーブル定義に合わせて明示追加する。
+CREATE OR ALTER VIEW dbo.vw_ProductItem_Normalized
+AS
+SELECT
+    productitemnamekanji AS productitemnamekanji_raw,
+    dbo.fn_NormalizeText(productitemnamekanji) AS productitemnamekanji
+FROM dbo.jp_dw_dsj_productitem_dim;
+
+
+==========================================================================================
+FILE: sql/03_common/30_verify_common.sql
+==========================================================================================
+-- OneForce / Microsoft Fabric T-SQL / v2.0 / 2026-11-05
+-- 対象: GoldLakehouse SQL分析エンドポイント、または同一ソースを持つWarehouse。
+-- Spark SQLセルでは実行しない。接続先DBを確認し、このファイルを1バッチで実行。
+-- UTF-8 DB照合順序、スカラーUDF、varchar(max)対応が前提。
+-- 元データのU+0000は入力契約外。元データへのDMLは行わない。
+
+SET NOCOUNT ON;
+IF OBJECT_ID(N'dbo.fn_NormalizeText', N'FN') IS NULL
+    THROW 51003, N'正式Functionが存在しません。', 1;
+IF OBJECT_ID(N'dbo.vw_ProductItem_Normalized', N'V') IS NULL
+    THROW 51007, N'共通Viewが存在しません。', 1;
+SELECT o.name, o.type_desc, m.is_inlineable
+FROM sys.objects AS o JOIN sys.sql_modules AS m ON m.object_id=o.object_id
+WHERE o.object_id IN (OBJECT_ID(N'dbo.fn_NormalizeText'), OBJECT_ID(N'dbo.vw_ProductItem_Normalized'));
+
+DECLARE @source_count bigint, @view_count bigint;
+SELECT @source_count = COUNT_BIG(*) FROM dbo.jp_dw_dsj_productitem_dim;
+SELECT @view_count = COUNT_BIG(*) FROM dbo.vw_ProductItem_Normalized;
+IF @source_count <> @view_count
+    THROW 51008, N'元表とViewの件数が一致しません。同時更新の有無も確認してください。', 1;
+SELECT @source_count AS source_count, @view_count AS view_count;
+
+-- 長さ・値の両方で比較し、SQLの末尾空白比較特性による見逃しを防止する。
+-- 比較対象は未加工のraw列。既に整形済みの列を再整形しない。
+IF EXISTS (
+    SELECT 1 FROM dbo.vw_ProductItem_Normalized
+    WHERE
+      (productitemnamekanji_raw IS NULL AND productitemnamekanji IS NOT NULL)
+      OR (productitemnamekanji_raw IS NOT NULL AND productitemnamekanji IS NULL)
+      OR (productitemnamekanji_raw IS NOT NULL AND productitemnamekanji IS NOT NULL AND
+          (DATALENGTH(productitemnamekanji) <> DATALENGTH(dbo.fn_NormalizeText(productitemnamekanji_raw))
+           OR productitemnamekanji COLLATE Latin1_General_100_BIN2_UTF8 <>
+              dbo.fn_NormalizeText(productitemnamekanji_raw) COLLATE Latin1_General_100_BIN2_UTF8))
+)
+    THROW 51009, N'Viewの整形結果が関数単体結果と一致しません。', 1;
+SELECT TOP (100) DATALENGTH(productitemnamekanji_raw) AS raw_bytes,
+                 DATALENGTH(productitemnamekanji) AS normalized_bytes
+FROM dbo.vw_ProductItem_Normalized;
+SELECT 'PASS' AS common_verification;
+-- 件数照合はソース更新を止めた検証時間帯で実施する。
+-- 受入にはさらに01/02_scalar_tests.sql内の関数名を正式名に替えて回帰試験を行う。
+
+
+==========================================================================================
+FILE: sql/03_common/31_regression_tests.sql
+==========================================================================================
+-- OneForce / Microsoft Fabric T-SQL / v2.0 / 2026-11-05
+-- 対象: GoldLakehouse SQL分析エンドポイント、または同一ソースを持つWarehouse。
+-- Spark SQLセルでは実行しない。接続先DBを確認し、このファイルを1バッチで実行。
+-- UTF-8 DB照合順序、スカラーUDF、varchar(max)対応が前提。
+-- 元データのU+0000は入力契約外。元データへのDMLは行わない。
+
+SET NOCOUNT ON;
+DECLARE @actual varchar(max), @expected varchar(max);
+
+-- TXT01: NULL
+SET @actual = dbo.fn_NormalizeText(CAST(NULL AS varchar(max)));
+SET @expected = CAST(NULL AS varchar(max));
+IF (@actual IS NULL AND @expected IS NOT NULL)
+   OR (@actual IS NOT NULL AND @expected IS NULL)
+   OR (@actual IS NOT NULL AND @expected IS NOT NULL AND (
+       DATALENGTH(@actual) <> DATALENGTH(@expected)
+       OR @actual COLLATE Latin1_General_100_BIN2_UTF8 <> @expected COLLATE Latin1_General_100_BIN2_UTF8))
+    THROW 51010, N'TXT01: 期待値不一致', 1;
+SELECT 'TXT01' AS case_id, 'PASS' AS status, DATALENGTH(@actual) AS result_bytes;
+
+-- TXT02: 空文字
+SET @actual = dbo.fn_NormalizeText(CAST((N'') COLLATE Latin1_General_100_BIN2_UTF8 AS varchar(max)));
+SET @expected = CAST((N'') COLLATE Latin1_General_100_BIN2_UTF8 AS varchar(max));
+IF (@actual IS NULL AND @expected IS NOT NULL)
+   OR (@actual IS NOT NULL AND @expected IS NULL)
+   OR (@actual IS NOT NULL AND @expected IS NOT NULL AND (
+       DATALENGTH(@actual) <> DATALENGTH(@expected)
+       OR @actual COLLATE Latin1_General_100_BIN2_UTF8 <> @expected COLLATE Latin1_General_100_BIN2_UTF8))
+    THROW 51010, N'TXT02: 期待値不一致', 1;
+SELECT 'TXT02' AS case_id, 'PASS' AS status, DATALENGTH(@actual) AS result_bytes;
+
+-- TXT03: 半角空白のみ
+SET @actual = dbo.fn_NormalizeText(CAST((N'   ') COLLATE Latin1_General_100_BIN2_UTF8 AS varchar(max)));
+SET @expected = CAST((N'') COLLATE Latin1_General_100_BIN2_UTF8 AS varchar(max));
+IF (@actual IS NULL AND @expected IS NOT NULL)
+   OR (@actual IS NOT NULL AND @expected IS NULL)
+   OR (@actual IS NOT NULL AND @expected IS NOT NULL AND (
+       DATALENGTH(@actual) <> DATALENGTH(@expected)
+       OR @actual COLLATE Latin1_General_100_BIN2_UTF8 <> @expected COLLATE Latin1_General_100_BIN2_UTF8))
+    THROW 51010, N'TXT03: 期待値不一致', 1;
+SELECT 'TXT03' AS case_id, 'PASS' AS status, DATALENGTH(@actual) AS result_bytes;
+
+-- TXT04: 全角空白のみ
+SET @actual = dbo.fn_NormalizeText(CAST((NCHAR(12288) + NCHAR(12288)) COLLATE Latin1_General_100_BIN2_UTF8 AS varchar(max)));
+SET @expected = CAST((N'') COLLATE Latin1_General_100_BIN2_UTF8 AS varchar(max));
+IF (@actual IS NULL AND @expected IS NOT NULL)
+   OR (@actual IS NOT NULL AND @expected IS NULL)
+   OR (@actual IS NOT NULL AND @expected IS NOT NULL AND (
+       DATALENGTH(@actual) <> DATALENGTH(@expected)
+       OR @actual COLLATE Latin1_General_100_BIN2_UTF8 <> @expected COLLATE Latin1_General_100_BIN2_UTF8))
+    THROW 51010, N'TXT04: 期待値不一致', 1;
+SELECT 'TXT04' AS case_id, 'PASS' AS status, DATALENGTH(@actual) AS result_bytes;
+
+-- TXT05: NBSPのみ
+SET @actual = dbo.fn_NormalizeText(CAST((NCHAR(160) + NCHAR(160)) COLLATE Latin1_General_100_BIN2_UTF8 AS varchar(max)));
+SET @expected = CAST((N'') COLLATE Latin1_General_100_BIN2_UTF8 AS varchar(max));
+IF (@actual IS NULL AND @expected IS NOT NULL)
+   OR (@actual IS NOT NULL AND @expected IS NULL)
+   OR (@actual IS NOT NULL AND @expected IS NOT NULL AND (
+       DATALENGTH(@actual) <> DATALENGTH(@expected)
+       OR @actual COLLATE Latin1_General_100_BIN2_UTF8 <> @expected COLLATE Latin1_General_100_BIN2_UTF8))
+    THROW 51010, N'TXT05: 期待値不一致', 1;
+SELECT 'TXT05' AS case_id, 'PASS' AS status, DATALENGTH(@actual) AS result_bytes;
+
+-- TXT06: 混在した前後空白
+SET @actual = dbo.fn_NormalizeText(CAST((N' ' + NCHAR(12288) + NCHAR(160) + N'製品A' + NCHAR(12288) + N' ' + NCHAR(160)) COLLATE Latin1_General_100_BIN2_UTF8 AS varchar(max)));
+SET @expected = CAST((N'製品A') COLLATE Latin1_General_100_BIN2_UTF8 AS varchar(max));
+IF (@actual IS NULL AND @expected IS NOT NULL)
+   OR (@actual IS NOT NULL AND @expected IS NULL)
+   OR (@actual IS NOT NULL AND @expected IS NOT NULL AND (
+       DATALENGTH(@actual) <> DATALENGTH(@expected)
+       OR @actual COLLATE Latin1_General_100_BIN2_UTF8 <> @expected COLLATE Latin1_General_100_BIN2_UTF8))
+    THROW 51010, N'TXT06: 期待値不一致', 1;
+SELECT 'TXT06' AS case_id, 'PASS' AS status, DATALENGTH(@actual) AS result_bytes;
+
+-- TXT07: 引用符
+SET @actual = dbo.fn_NormalizeText(CAST((N' A"B ') COLLATE Latin1_General_100_BIN2_UTF8 AS varchar(max)));
+SET @expected = CAST((N'A""B') COLLATE Latin1_General_100_BIN2_UTF8 AS varchar(max));
+IF (@actual IS NULL AND @expected IS NOT NULL)
+   OR (@actual IS NOT NULL AND @expected IS NULL)
+   OR (@actual IS NOT NULL AND @expected IS NOT NULL AND (
+       DATALENGTH(@actual) <> DATALENGTH(@expected)
+       OR @actual COLLATE Latin1_General_100_BIN2_UTF8 <> @expected COLLATE Latin1_General_100_BIN2_UTF8))
+    THROW 51010, N'TXT07: 期待値不一致', 1;
+SELECT 'TXT07' AS case_id, 'PASS' AS status, DATALENGTH(@actual) AS result_bytes;
+
+-- TXT08: 連続引用符
+SET @actual = dbo.fn_NormalizeText(CAST((N'""') COLLATE Latin1_General_100_BIN2_UTF8 AS varchar(max)));
+SET @expected = CAST((N'""""') COLLATE Latin1_General_100_BIN2_UTF8 AS varchar(max));
+IF (@actual IS NULL AND @expected IS NOT NULL)
+   OR (@actual IS NOT NULL AND @expected IS NULL)
+   OR (@actual IS NOT NULL AND @expected IS NOT NULL AND (
+       DATALENGTH(@actual) <> DATALENGTH(@expected)
+       OR @actual COLLATE Latin1_General_100_BIN2_UTF8 <> @expected COLLATE Latin1_General_100_BIN2_UTF8))
+    THROW 51010, N'TXT08: 期待値不一致', 1;
+SELECT 'TXT08' AS case_id, 'PASS' AS status, DATALENGTH(@actual) AS result_bytes;
+
+-- TXT09: 内部空白保持
+SET @actual = dbo.fn_NormalizeText(CAST((N' A B' + NCHAR(160) + N'C' + NCHAR(12288) + N'D ') COLLATE Latin1_General_100_BIN2_UTF8 AS varchar(max)));
+SET @expected = CAST((N'A B' + NCHAR(160) + N'C' + NCHAR(12288) + N'D') COLLATE Latin1_General_100_BIN2_UTF8 AS varchar(max));
+IF (@actual IS NULL AND @expected IS NOT NULL)
+   OR (@actual IS NOT NULL AND @expected IS NULL)
+   OR (@actual IS NOT NULL AND @expected IS NOT NULL AND (
+       DATALENGTH(@actual) <> DATALENGTH(@expected)
+       OR @actual COLLATE Latin1_General_100_BIN2_UTF8 <> @expected COLLATE Latin1_General_100_BIN2_UTF8))
+    THROW 51010, N'TXT09: 期待値不一致', 1;
+SELECT 'TXT09' AS case_id, 'PASS' AS status, DATALENGTH(@actual) AS result_bytes;
+
+-- TXT10: タブ保持
+SET @actual = dbo.fn_NormalizeText(CAST((NCHAR(9) + N'A' + NCHAR(9)) COLLATE Latin1_General_100_BIN2_UTF8 AS varchar(max)));
+SET @expected = CAST((NCHAR(9) + N'A' + NCHAR(9)) COLLATE Latin1_General_100_BIN2_UTF8 AS varchar(max));
+IF (@actual IS NULL AND @expected IS NOT NULL)
+   OR (@actual IS NOT NULL AND @expected IS NULL)
+   OR (@actual IS NOT NULL AND @expected IS NOT NULL AND (
+       DATALENGTH(@actual) <> DATALENGTH(@expected)
+       OR @actual COLLATE Latin1_General_100_BIN2_UTF8 <> @expected COLLATE Latin1_General_100_BIN2_UTF8))
+    THROW 51010, N'TXT10: 期待値不一致', 1;
+SELECT 'TXT10' AS case_id, 'PASS' AS status, DATALENGTH(@actual) AS result_bytes;
+
+-- TXT11: 改行保持
+SET @actual = dbo.fn_NormalizeText(CAST((NCHAR(10) + N'A' + NCHAR(10)) COLLATE Latin1_General_100_BIN2_UTF8 AS varchar(max)));
+SET @expected = CAST((NCHAR(10) + N'A' + NCHAR(10)) COLLATE Latin1_General_100_BIN2_UTF8 AS varchar(max));
+IF (@actual IS NULL AND @expected IS NOT NULL)
+   OR (@actual IS NOT NULL AND @expected IS NULL)
+   OR (@actual IS NOT NULL AND @expected IS NOT NULL AND (
+       DATALENGTH(@actual) <> DATALENGTH(@expected)
+       OR @actual COLLATE Latin1_General_100_BIN2_UTF8 <> @expected COLLATE Latin1_General_100_BIN2_UTF8))
+    THROW 51010, N'TXT11: 期待値不一致', 1;
+SELECT 'TXT11' AS case_id, 'PASS' AS status, DATALENGTH(@actual) AS result_bytes;
+
+-- TXT12: CRLF保持
+SET @actual = dbo.fn_NormalizeText(CAST((N' A' + NCHAR(13) + NCHAR(10) + N'B ') COLLATE Latin1_General_100_BIN2_UTF8 AS varchar(max)));
+SET @expected = CAST((N'A' + NCHAR(13) + NCHAR(10) + N'B') COLLATE Latin1_General_100_BIN2_UTF8 AS varchar(max));
+IF (@actual IS NULL AND @expected IS NOT NULL)
+   OR (@actual IS NOT NULL AND @expected IS NULL)
+   OR (@actual IS NOT NULL AND @expected IS NOT NULL AND (
+       DATALENGTH(@actual) <> DATALENGTH(@expected)
+       OR @actual COLLATE Latin1_General_100_BIN2_UTF8 <> @expected COLLATE Latin1_General_100_BIN2_UTF8))
+    THROW 51010, N'TXT12: 期待値不一致', 1;
+SELECT 'TXT12' AS case_id, 'PASS' AS status, DATALENGTH(@actual) AS result_bytes;
+
+-- TXT13: 最終改行の直前空白を保持
+SET @actual = dbo.fn_NormalizeText(CAST((N' A ' + NCHAR(10)) COLLATE Latin1_General_100_BIN2_UTF8 AS varchar(max)));
+SET @expected = CAST((N'A ' + NCHAR(10)) COLLATE Latin1_General_100_BIN2_UTF8 AS varchar(max));
+IF (@actual IS NULL AND @expected IS NOT NULL)
+   OR (@actual IS NOT NULL AND @expected IS NULL)
+   OR (@actual IS NOT NULL AND @expected IS NOT NULL AND (
+       DATALENGTH(@actual) <> DATALENGTH(@expected)
+       OR @actual COLLATE Latin1_General_100_BIN2_UTF8 <> @expected COLLATE Latin1_General_100_BIN2_UTF8))
+    THROW 51010, N'TXT13: 期待値不一致', 1;
+SELECT 'TXT13' AS case_id, 'PASS' AS status, DATALENGTH(@actual) AS result_bytes;
+
+-- TXT14: 先頭タブ直後の空白を保持
+SET @actual = dbo.fn_NormalizeText(CAST((NCHAR(9) + N' A ') COLLATE Latin1_General_100_BIN2_UTF8 AS varchar(max)));
+SET @expected = CAST((NCHAR(9) + N' A') COLLATE Latin1_General_100_BIN2_UTF8 AS varchar(max));
+IF (@actual IS NULL AND @expected IS NOT NULL)
+   OR (@actual IS NOT NULL AND @expected IS NULL)
+   OR (@actual IS NOT NULL AND @expected IS NOT NULL AND (
+       DATALENGTH(@actual) <> DATALENGTH(@expected)
+       OR @actual COLLATE Latin1_General_100_BIN2_UTF8 <> @expected COLLATE Latin1_General_100_BIN2_UTF8))
+    THROW 51010, N'TXT14: 期待値不一致', 1;
+SELECT 'TXT14' AS case_id, 'PASS' AS status, DATALENGTH(@actual) AS result_bytes;
+
+-- TXT15: シングルクォート保持
+SET @actual = dbo.fn_NormalizeText(CAST((N' O''Brien ') COLLATE Latin1_General_100_BIN2_UTF8 AS varchar(max)));
+SET @expected = CAST((N'O''Brien') COLLATE Latin1_General_100_BIN2_UTF8 AS varchar(max));
+IF (@actual IS NULL AND @expected IS NOT NULL)
+   OR (@actual IS NOT NULL AND @expected IS NULL)
+   OR (@actual IS NOT NULL AND @expected IS NOT NULL AND (
+       DATALENGTH(@actual) <> DATALENGTH(@expected)
+       OR @actual COLLATE Latin1_General_100_BIN2_UTF8 <> @expected COLLATE Latin1_General_100_BIN2_UTF8))
+    THROW 51010, N'TXT15: 期待値不一致', 1;
+SELECT 'TXT15' AS case_id, 'PASS' AS status, DATALENGTH(@actual) AS result_bytes;
+
+-- TXT16: 絵文字
+SET @actual = dbo.fn_NormalizeText(CAST((N' 😀製品 ') COLLATE Latin1_General_100_BIN2_UTF8 AS varchar(max)));
+SET @expected = CAST((N'😀製品') COLLATE Latin1_General_100_BIN2_UTF8 AS varchar(max));
+IF (@actual IS NULL AND @expected IS NOT NULL)
+   OR (@actual IS NOT NULL AND @expected IS NULL)
+   OR (@actual IS NOT NULL AND @expected IS NOT NULL AND (
+       DATALENGTH(@actual) <> DATALENGTH(@expected)
+       OR @actual COLLATE Latin1_General_100_BIN2_UTF8 <> @expected COLLATE Latin1_General_100_BIN2_UTF8))
+    THROW 51010, N'TXT16: 期待値不一致', 1;
+SELECT 'TXT16' AS case_id, 'PASS' AS status, DATALENGTH(@actual) AS result_bytes;
+
+-- TXT17: 除去対象外の細い空白
+SET @actual = dbo.fn_NormalizeText(CAST((NCHAR(8201) + N'A' + NCHAR(8201)) COLLATE Latin1_General_100_BIN2_UTF8 AS varchar(max)));
+SET @expected = CAST((NCHAR(8201) + N'A' + NCHAR(8201)) COLLATE Latin1_General_100_BIN2_UTF8 AS varchar(max));
+IF (@actual IS NULL AND @expected IS NOT NULL)
+   OR (@actual IS NOT NULL AND @expected IS NULL)
+   OR (@actual IS NOT NULL AND @expected IS NOT NULL AND (
+       DATALENGTH(@actual) <> DATALENGTH(@expected)
+       OR @actual COLLATE Latin1_General_100_BIN2_UTF8 <> @expected COLLATE Latin1_General_100_BIN2_UTF8))
+    THROW 51010, N'TXT17: 期待値不一致', 1;
+SELECT 'TXT17' AS case_id, 'PASS' AS status, DATALENGTH(@actual) AS result_bytes;
+
+-- TXT18: 大小文字保持
+SET @actual = dbo.fn_NormalizeText(CAST((N' aBc ') COLLATE Latin1_General_100_BIN2_UTF8 AS varchar(max)));
+SET @expected = CAST((N'aBc') COLLATE Latin1_General_100_BIN2_UTF8 AS varchar(max));
+IF (@actual IS NULL AND @expected IS NOT NULL)
+   OR (@actual IS NOT NULL AND @expected IS NULL)
+   OR (@actual IS NOT NULL AND @expected IS NOT NULL AND (
+       DATALENGTH(@actual) <> DATALENGTH(@expected)
+       OR @actual COLLATE Latin1_General_100_BIN2_UTF8 <> @expected COLLATE Latin1_General_100_BIN2_UTF8))
+    THROW 51010, N'TXT18: 期待値不一致', 1;
+SELECT 'TXT18' AS case_id, 'PASS' AS status, DATALENGTH(@actual) AS result_bytes;
+
+-- TXT19: 全角二重引用符保持
+SET @actual = dbo.fn_NormalizeText(CAST((N' ＂A＂ ') COLLATE Latin1_General_100_BIN2_UTF8 AS varchar(max)));
+SET @expected = CAST((N'＂A＂') COLLATE Latin1_General_100_BIN2_UTF8 AS varchar(max));
+IF (@actual IS NULL AND @expected IS NOT NULL)
+   OR (@actual IS NOT NULL AND @expected IS NULL)
+   OR (@actual IS NOT NULL AND @expected IS NOT NULL AND (
+       DATALENGTH(@actual) <> DATALENGTH(@expected)
+       OR @actual COLLATE Latin1_General_100_BIN2_UTF8 <> @expected COLLATE Latin1_General_100_BIN2_UTF8))
+    THROW 51010, N'TXT19: 期待値不一致', 1;
+SELECT 'TXT19' AS case_id, 'PASS' AS status, DATALENGTH(@actual) AS result_bytes;
+
+-- TXT20: 8000バイト超の引用符展開
+SET @actual = dbo.fn_NormalizeText(REPLICATE(CAST('"' AS varchar(max)), 5000));
+SET @expected = REPLICATE(CAST('"' AS varchar(max)), 10000);
+IF (@actual IS NULL AND @expected IS NOT NULL)
+   OR (@actual IS NOT NULL AND @expected IS NULL)
+   OR (@actual IS NOT NULL AND @expected IS NOT NULL AND (
+       DATALENGTH(@actual) <> DATALENGTH(@expected)
+       OR @actual COLLATE Latin1_General_100_BIN2_UTF8 <> @expected COLLATE Latin1_General_100_BIN2_UTF8))
+    THROW 51010, N'TXT20: 期待値不一致', 1;
+SELECT 'TXT20' AS case_id, 'PASS' AS status, DATALENGTH(@actual) AS result_bytes;
+
+-- TXT21: 再適用により引用符が更に二重化される（非冪等）。
+IF dbo.fn_NormalizeText(dbo.fn_NormalizeText('"')) <> '""""'
+    THROW 51010, N'TXT21: 非冪等性の期待値不一致', 1;
+SELECT 'TXT21' AS case_id, 'PASS' AS status;
+SELECT 'ALL_PASS' AS summary, 21 AS test_count;
+
+
+==========================================================================================
+FILE: tests/normalization_cases.json
+==========================================================================================
+[
+  {
+    "case_id": "TXT01",
+    "description": "NULL",
+    "input": null,
+    "expected": null
+  },
+  {
+    "case_id": "TXT02",
+    "description": "空文字",
+    "input": "",
+    "expected": ""
+  },
+  {
+    "case_id": "TXT03",
+    "description": "半角空白のみ",
+    "input": "   ",
+    "expected": ""
+  },
+  {
+    "case_id": "TXT04",
+    "description": "全角空白のみ",
+    "input": "　　",
+    "expected": ""
+  },
+  {
+    "case_id": "TXT05",
+    "description": "NBSPのみ",
+    "input": "  ",
+    "expected": ""
+  },
+  {
+    "case_id": "TXT06",
+    "description": "混在した前後空白",
+    "input": " 　 製品A　  ",
+    "expected": "製品A"
+  },
+  {
+    "case_id": "TXT07",
+    "description": "引用符",
+    "input": " A\"B ",
+    "expected": "A\"\"B"
+  },
+  {
+    "case_id": "TXT08",
+    "description": "連続引用符",
+    "input": "\"\"",
+    "expected": "\"\"\"\""
+  },
+  {
+    "case_id": "TXT09",
+    "description": "内部空白保持",
+    "input": " A B C　D ",
+    "expected": "A B C　D"
+  },
+  {
+    "case_id": "TXT10",
+    "description": "タブ保持",
+    "input": "\tA\t",
+    "expected": "\tA\t"
+  },
+  {
+    "case_id": "TXT11",
+    "description": "改行保持",
+    "input": "\nA\n",
+    "expected": "\nA\n"
+  },
+  {
+    "case_id": "TXT12",
+    "description": "CRLF保持",
+    "input": " A\r\nB ",
+    "expected": "A\r\nB"
+  },
+  {
+    "case_id": "TXT13",
+    "description": "最終改行の直前空白を保持",
+    "input": " A \n",
+    "expected": "A \n"
+  },
+  {
+    "case_id": "TXT14",
+    "description": "先頭タブ直後の空白を保持",
+    "input": "\t A ",
+    "expected": "\t A"
+  },
+  {
+    "case_id": "TXT15",
+    "description": "シングルクォート保持",
+    "input": " O'Brien ",
+    "expected": "O'Brien"
+  },
+  {
+    "case_id": "TXT16",
+    "description": "絵文字",
+    "input": " 😀製品 ",
+    "expected": "😀製品"
+  },
+  {
+    "case_id": "TXT17",
+    "description": "除去対象外の細い空白",
+    "input": " A ",
+    "expected": " A "
+  },
+  {
+    "case_id": "TXT18",
+    "description": "大小文字保持",
+    "input": " aBc ",
+    "expected": "aBc"
+  },
+  {
+    "case_id": "TXT19",
+    "description": "全角二重引用符保持",
+    "input": " ＂A＂ ",
+    "expected": "＂A＂"
+  },
+  {
+    "case_id": "TXT20",
+    "description": "8000バイト超の引用符展開",
+    "input": "\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"",
+    "expected": "\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\""
+  }
+]
+
+
+==========================================================================================
+FILE: tests/test_common_functions.py
+==========================================================================================
+"""Pure-Python tests. Run: python -m unittest discover -s tests -v"""
+import contextlib
+import io
+import json
+from pathlib import Path
+import sys
+import unittest
+from unittest.mock import Mock
+
+BASE = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(BASE / "python"))
+from common_functions import (
+    CommonError, COMMON_VERSION, DEFAULT_CONFIG, OUTPUT_ROOT, normalize_text,
+    parse_config, quote_table_name, validate_identifier, validate_execution_id,
+    parse_run_result, run_common_notebook, log_event,
+)
+
+
+class NormalizeTests(unittest.TestCase):
+    def test_type_rejected(self):
+        for value in (1, 1.2, True, [], {}, b"abc"):
+            with self.subTest(value=repr(value)), self.assertRaises(CommonError) as ctx:
+                normalize_text(value)
+            self.assertEqual(ctx.exception.code, "CMN001")
+
+    def test_nul_rejected(self):
+        with self.assertRaises(CommonError) as ctx:
+            normalize_text("A\x00B")
+        self.assertEqual(ctx.exception.code, "CMN008")
+
+    def test_not_idempotent(self):
+        self.assertEqual(normalize_text(normalize_text('"')), '""""')
+
+
+for case in json.loads((BASE / "tests/normalization_cases.json").read_text(encoding="utf-8")):
+    def check(self, case=case):
+        self.assertEqual(normalize_text(case["input"]), case["expected"], case["description"])
+    setattr(NormalizeTests, "test_" + case["case_id"], check)
+
+
+class ConfigTests(unittest.TestCase):
+    def test_defaults(self):
+        self.assertEqual(parse_config("{}"), DEFAULT_CONFIG)
+
+    def test_valid_config(self):
+        self.assertTrue(parse_config('{"mode":"table","write_output":true}')["write_output"])
+
+    def test_invalid_json(self):
+        for value in ("", "{", "[]", "null", "true", None, " " * 16385):
+            with self.subTest(value=repr(value)[:30]), self.assertRaises(CommonError):
+                parse_config(value)
+
+    def test_duplicate_keys(self):
+        with self.assertRaises(CommonError):
+            parse_config('{"mode":"sample","mode":"table"}')
+
+    def test_nonfinite(self):
+        for value in ("NaN", "Infinity", "-Infinity"):
+            with self.subTest(value=value), self.assertRaises(CommonError):
+                parse_config('{"write_output":' + value + '}')
+
+    def test_unknown_key(self):
+        with self.assertRaises(CommonError):
+            parse_config('{"overwrite":true}')
+
+    def test_invalid_modes(self):
+        for value in ("TABLE", "", 0, None, {}, []):
+            with self.subTest(value=value), self.assertRaises(CommonError):
+                parse_config(json.dumps({"mode": value}))
+
+    def test_boolean_type(self):
+        for name in ("write_output", "allow_empty"):
+            for value in ("false", 0, 1, None):
+                with self.subTest(name=name,value=value), self.assertRaises(CommonError):
+                    parse_config(json.dumps({name: value}))
+
+    def test_source_output_collision(self):
+        with self.assertRaises(CommonError) as ctx:
+            parse_config('{"source_column":"A","output_column":"a"}')
+        self.assertEqual(ctx.exception.code, "CMN005")
+
+    def test_valid_identifiers(self):
+        for value in ("a", "_a", "a1", "A" * 128, "select"):
+            self.assertEqual(validate_identifier(value), value)
+        self.assertEqual(quote_table_name("GoldLakehouse.dbo.products"), "`GoldLakehouse`.`dbo`.`products`")
+        self.assertEqual(quote_table_name("select"), "`select`")
+
+    def test_invalid_identifiers(self):
+        for value in ("", "1a", "a;b", "a`", "a-b", "日本", "a\n", "a"*129, None):
+            with self.subTest(value=value), self.assertRaises(CommonError):
+                validate_identifier(value)
+
+    def test_invalid_table_names(self):
+        for value in ("a..b", "a.b.c.d", ".a", "a.", "../a", None):
+            with self.subTest(value=value), self.assertRaises(CommonError):
+                quote_table_name(value)
+
+    def test_execution_id(self):
+        for value in ("", "../x", "_x", "x/y", "A"*65, None):
+            with self.subTest(value=value), self.assertRaises(CommonError):
+                validate_execution_id(value)
+        self.assertEqual(validate_execution_id("job_01-ABC"), "job_01-ABC")
+
+
+class CallerTests(unittest.TestCase):
+    def setUp(self):
+        self.result = {"contract_version":"1.0", "status":"SUCCESS", "execution_id":"test-001",
+            "mode":"sample", "row_count":6, "changed_count":4, "null_count":1,
+            "output_column":"productitemnamekanji_normalized", "output_path":None,
+            "write_output":False, "library_version":COMMON_VERSION}
+
+    def test_valid_return(self):
+        self.assertEqual(parse_run_result(json.dumps(self.result), "test-001"), self.result)
+
+    def test_missing_and_extra_fields(self):
+        for result in ({k:v for k,v in self.result.items() if k!="row_count"}, {**self.result,"extra":1}):
+            with self.subTest(result=result), self.assertRaises(CommonError):
+                parse_run_result(json.dumps(result), "test-001")
+
+    def test_bad_return_properties(self):
+        updates=[("status","ERROR"),("execution_id","other"),("contract_version","2.0"),
+            ("library_version","old"),("row_count",True),("row_count",-1),("row_count",1.0),
+            ("changed_count",7),("null_count",7),("mode","INVALID"),("write_output","false"),
+            ("output_path","../evil"),("output_column","bad;name")]
+        for key,value in updates:
+            with self.subTest(key=key,value=value), self.assertRaises(CommonError):
+                parse_run_result(json.dumps({**self.result,key:value}), "test-001")
+
+    def test_write_path(self):
+        good={**self.result,"write_output":True,"output_path":f"{OUTPUT_ROOT}/test-001"}
+        self.assertEqual(parse_run_result(json.dumps(good),"test-001"),good)
+
+    def test_empty_return(self):
+        for value in ("", "not-json", "null", "[]"):
+            with self.subTest(value=value), self.assertRaises(CommonError):
+                parse_run_result(value,"test-001")
+
+    def test_call_and_arguments(self):
+        runner=Mock(return_value=json.dumps(self.result))
+        self.assertEqual(run_common_notebook(runner,'{}',"test-001"),self.result)
+        args=runner.call_args.args
+        self.assertEqual(args[:2],("NB_CommonTransform",600))
+        self.assertEqual(args[2]["execution_id"],"test-001")
+        self.assertEqual(json.loads(args[2]["param_json"]),DEFAULT_CONFIG)
+        runner.assert_called_once()
+
+    def test_exception_propagated_without_retry(self):
+        runner=Mock(side_effect=TimeoutError("simulated timeout"))
+        with self.assertRaises(TimeoutError):
+            run_common_notebook(runner,"{}","test-001")
+        runner.assert_called_once()
+
+    def test_bad_timeout_before_call(self):
+        runner=Mock()
+        for value in (0,-1,43201,True,"600",None):
+            with self.subTest(value=value), self.assertRaises(CommonError):
+                run_common_notebook(runner,"{}","test-001",value)
+        runner.assert_not_called()
+
+    def test_parameter_mismatch(self):
+        runner=Mock(return_value=json.dumps({**self.result,"mode":"table"}))
+        with self.assertRaises(CommonError):
+            run_common_notebook(runner,"{}","test-001")
+
+    def test_disallowed_zero_rows(self):
+        runner=Mock(return_value=json.dumps({**self.result,"row_count":0,"changed_count":0,"null_count":0}))
+        with self.assertRaises(CommonError):
+            run_common_notebook(runner,"{}","test-001")
+        result=run_common_notebook(runner,'{"allow_empty":true}',"test-001")
+        self.assertEqual(result["row_count"],0)
+
+    def test_logging(self):
+        out=io.StringIO()
+        with contextlib.redirect_stdout(out):
+            log_event("INFO","TEST","test-001",row_count=6)
+        entry=json.loads(out.getvalue())
+        self.assertEqual(entry["metadata"],{"row_count":6})
+        self.assertIn("+00:00",entry["timestamp_utc"])
+
+
+if __name__ == "__main__":
+    unittest.main()
+

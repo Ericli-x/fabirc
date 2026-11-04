@@ -1,0 +1,42 @@
+# NB_ProductItem_Main
+# セル単位でFabric Notebookへコピー。Pythonファイルとしての一括実行は不可。
+
+===== CELL 1: markdown =====
+# ④ 共通Notebookを呼び出す親Notebook
+既定はサンプル・書込みなし。実テーブル実行時は`config/productitem.json`の内容を`param_json`に設定。`write_output=true`は実行ID別の新規Delta出力を許可する明示指定。
+
+===== CELL 2: code（パラメータセルとしてマーク） =====
+# このセルを「パラメータとしてマーク」。
+param_json = '{"mode":"sample","write_output":false}'
+execution_id = ""
+timeout_seconds = 600
+
+===== CELL 3: code =====
+%run NB_CommonFunctions
+
+===== CELL 4: code =====
+import json
+from uuid import uuid4
+if execution_id == "":
+    execution_id = str(uuid4())
+try:
+    validate_execution_id(execution_id)
+    log_event("INFO", "CALL_START", execution_id)
+    result = run_common_notebook(notebookutils.notebook.run, param_json,
+                                 execution_id, timeout_seconds)
+    # 子の変数を引き継ぐ想定にはしない。出力指定時はDeltaを読み直す。
+    normalized_df = None
+    if result["write_output"]:
+        normalized_df = spark.read.format("delta").load(result["output_path"])
+    log_event("INFO", "CALL_END", execution_id, row_count=result["row_count"],
+              changed_count=result["changed_count"])
+    result_json = json.dumps(result, ensure_ascii=False, allow_nan=False)
+except Exception as exc:
+    safe_id = execution_id if isinstance(execution_id, str) and len(execution_id) <= 64 else "invalid"
+    log_event("ERROR", "CALL_FAILED", safe_id, error_type=type(exc).__name__,
+              error_code=getattr(exc, "code", "FABRIC_RUNTIME"))
+    raise
+
+===== CELL 5: code =====
+# Pipelineへも同じ小さなJSONを返す。DataFrame自体は返さない。
+notebookutils.notebook.exit(result_json)

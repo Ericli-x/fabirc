@@ -1,0 +1,67 @@
+# NB_CommonReference_Precheck
+# セル単位でFabric Notebookへコピー。Pythonファイルとしての一括実行は不可。
+
+===== CELL 1: markdown =====
+# ② 別Notebook共通関数の参照呼出し事前検証
+`NB_CommonFunctions`を同一ワークスペースに配置後、PySparkで全セル実行。テーブル更新なし。
+
+===== CELL 2: code =====
+%run NB_CommonFunctions
+
+===== CELL 3: code =====
+import json
+from pyspark.sql import functions as F
+from pyspark.sql.types import StructType, StructField, StringType
+cases = [
+    ('TXT01', None, None),
+    ('TXT02', '', ''),
+    ('TXT03', '   ', ''),
+    ('TXT04', '\u3000\u3000', ''),
+    ('TXT05', '\xa0\xa0', ''),
+    ('TXT06', ' \u3000\xa0製品A\u3000 \xa0', '製品A'),
+    ('TXT07', ' A"B ', 'A""B'),
+    ('TXT08', '""', '""""'),
+    ('TXT09', ' A B\xa0C\u3000D ', 'A B\xa0C\u3000D'),
+    ('TXT10', '\tA\t', '\tA\t'),
+    ('TXT11', '\nA\n', '\nA\n'),
+    ('TXT12', ' A\r\nB ', 'A\r\nB'),
+    ('TXT13', ' A \n', 'A \n'),
+    ('TXT14', '\t A ', '\t A'),
+    ('TXT15', " O'Brien ", "O'Brien"),
+    ('TXT16', ' 😀製品 ', '😀製品'),
+    ('TXT17', '\u2009A\u2009', '\u2009A\u2009'),
+    ('TXT18', ' aBc ', 'aBc'),
+    ('TXT19', ' ＂A＂ ', '＂A＂'),
+    ("TXT20", '"' * 5000, '"' * 10000),
+]
+for case_id, value, expected in cases:
+    actual = normalize_text(value)
+    if actual != expected:
+        raise AssertionError(f"{case_id}: Python結果不一致")
+try:
+    normalize_text(123)
+except CommonError as exc:
+    if exc.code != "CMN001":
+        raise
+else:
+    raise AssertionError("型不正が検出されませんでした")
+for bad in ["tbl;DROP", "a..b", "a.b.c.d", "../x"]:
+    try:
+        quote_table_name(bad)
+    except CommonError:
+        pass
+    else:
+        raise AssertionError("識別子不正が検出されませんでした")
+# 明示schemaでNULL/空文字/長文を同一試験に含める。
+schema = StructType([StructField("case_id", StringType(), False),
+                     StructField("raw", StringType(), True),
+                     StructField("expected", StringType(), True)])
+df = spark.createDataFrame(cases, schema)
+actual_df = transform_dataframe(df, "raw", "actual")
+failures = actual_df.where(~F.col("actual").eqNullSafe(F.col("expected"))).select("case_id").collect()
+if failures:
+    raise AssertionError("Spark結果不一致: " + ",".join(row.case_id for row in failures))
+if normalize_text(normalize_text('"')) != '""""':
+    raise AssertionError("非冪等性の契約不一致")
+print(json.dumps({"status":"PASS", "python_cases":len(cases),
+                  "spark_cases":len(cases), "library_version":COMMON_VERSION},ensure_ascii=False))
